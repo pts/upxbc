@@ -1,0 +1,487 @@
+#! /usr/bin/python
+# by pts@fazekas.hu at Sun Dec 31 19:21:00 CET 2017
+
+import os
+import os.path
+import pipes
+import struct
+import subprocess
+import sys
+import zlib
+
+
+def parse_struct(fields, data):
+  values = struct.unpack('<' * (fields[0][1][0] not in '<>') + ''.join(f[1] for f in fields), data)
+  return dict(zip((f[0] for f in fields), values))
+
+
+def dump_struct(fields, data):
+  format = '<' * (fields[0][1][0] not in '<>') + ''.join(f[1] for f in fields)
+  values = struct.unpack(format, data)
+  print '--- Header ' + format
+  for (field_name, field_type), value in zip(fields, values):
+    if isinstance(value, (int, long)):
+      value = '0x%x' % value
+    else:
+      value = repr(value)
+    print '%s = %s' % (field_name, value)
+  print '---/Header'
+
+
+def get_elf32_header(len_data, load_addr=0x8048000):
+  # ELF 32-bit LSB  executable, Intel 80386, version 1 (GNU/Linux), statically linked, stripped.
+  # Contains ELF EHDR and 1 PHDR (program header).
+  if load_addr & 0xff:
+    raise ValueError('load_addr not aligned.')  # What would break?
+  return ''.join((  # 0x54 bytes.
+      '\x7fELF\x01\x01\x01\x03\0\0\0\0\0\0\0\0\x02\0\x03\0\x01\0\0\0',
+      struct.pack('<L', load_addr + 0x54),  # e_entry.
+      '4\0\0\0\0\0\0\0\0\0\0\x004\0\x20\0\x01\0\x28\0\0\0\0\0\x01\0\0\0\0\0\0\0',
+      # p_vaddr, p_paddr, p_filesz, p_memsz.
+      struct.pack('<LLLL', load_addr, load_addr, len_data + 0x54, len_data + 0x54),
+      '\x07\0\0\0\x01\0\0\0'))
+
+
+def compress_upx_elf32(code, load_addr, tmp_filename, method):
+  if not isinstance(code, str):
+    raise TypeError
+  if not isinstance(method, (list, tuple)):
+    raise TypeError
+  if load_addr is None:
+    load_addr = 0x8048000
+
+
+def bmcompress32(code, load_addr, tmp_filename, method='--ultra-brute', signature_start_ofs_max=0):
+  """!! write docstring"""
+  if not isinstance(code, str):
+    raise TypeError
+  if load_addr is None:
+    load_addr = 0x8048000
+
+  if not method or method == '--none':
+    return code  # Keep it uncompressed.
+  method = ['-' * (1 + (arg not in '123456789')) + arg for arg in
+            (arg.strip('-') for arg in method.replace(',', ' ').split()) if arg]
+  # Example good: '--best'.
+  # Example good: '--brute'.
+  # Example good: '--ultra-brute --lzma'.
+  # !! Which one includes --lzma by default?
+  # !! What is the minimum size for --lzma? (can we override with --lzma)?
+  if not method:
+    method.append('--ultra-brute')
+
+  # !! Don't compress the entire thing, keep a few bytes in front of the signature intact. Header?
+  # !! Use signature_start_ofs_max.
+
+  h = compress_upx_elf32(code, load_addr, tmp_filename, method)
+
+  elf32_header = get_elf32_header(len(code), load_addr)
+  f = open(tmp_filename, 'wb')
+  try:
+    f.write(elf32_header)
+    f.write(code)
+    padding_size = 4096 - len(code) - 0x54  # ELF32 header.
+    if padding_size > 0:  # Avoid UPX error: ': file is too small'.
+      f.write('\0' * padding_size)
+      # TODO(pts): Add more padding (for
+      # Packer::checkDefaultCompressionRatio), which is OK with at leat 4096
+      # bytes or 6.25% gain.
+  finally:
+    f.close()
+  os.chmod(tmp_filename, 0700)  # Avoid UPX error: ': file not executable'
+
+  # -qqq is totally quiet, it doesn't even print the exception.
+  # -qq prints one line with the sizes.
+  cmd = (
+      [(os.path.dirname(__file__) or '.') + '/tools/upx', '-qq'] +
+      method +
+      ['--', tmp_filename])
+  print >>sys.stderr, 'info: running: %s' % ' ' .join(map(pipes.quote, cmd))
+  try:
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+  except OSError:
+    os.unlink(tmp_filename)
+    raise RuntimeError('UPX not found: %x' % cmd[0])
+  try:
+    upx_stdout, upx_stderr = p.communicate('')
+  finally:
+    exit_code = p.wait()
+  if exit_code:
+    os.unlink(tmp_filename)
+    # 'upx: ...: IOException: file is too small -- skipped\n'
+    # 'upx: ...: NotCompressibleException\n'
+    if (': file is too small' in upx_stderr or
+        ': file is too large' in upx_stderr or
+        ': NotCompressibleException' in upx_stderr):
+      return code  # Keep the original if UPX can't improve it.  !!
+    sys.stderr.write(upx_stderr)
+    raise RuntimeError('UPX failed with exit_code=0x%x.' % exit_code)
+  # Don't print upx_stdout, it just contains statistics as a one-liner.
+  sys.stderr.write(upx_stderr)  # !! don't
+
+  # !! try different load_addr values
+  # !! what difference does relocateLoader() make? which symbols are relocated?
+
+  # The upx binary calls upx_ucl_compress and upx_lzma_compress is called
+  # with 3 different block sizes:
+  #
+  # * 0x54 (for the ELF32 header)
+  # * 0x65e == 1630 this is the modified stub_i386_linux_elf_fold of uncompressed size sizeof(stub_i386_linux_elf_fold) - fold_hdrlen == 1758 - 128 == 1630
+  #    buildLinuxLoader(
+  #      stub_i386_linux_elf_entry, sizeof(stub_i386_linux_elf_entry),
+  #      tmp,                       sizeof(stub_i386_linux_elf_fold),  ft );
+  # * len(code)
+
+  data = open(tmp_filename, 'rb').read()
+  i = 0
+  ehdr_fields = (
+      ('ei_mag', '4s'),
+      ('ei_class', 'B'),
+      ('ei_data', 'B'),
+      ('ei_version', 'B'),
+      ('e_osabi', 'B'),
+      ('e_abiversion', 'B'),
+      ('e_pad', '7s'),
+      ('e_type', 'H'),
+      ('e_machine', 'H'),
+      ('e_version', 'L'),
+      ('e_entry', 'L'),
+      ('e_phoff', 'L'),
+      ('e_shoff', 'L'),
+      ('e_flags', 'L'),
+      ('e_ehsize', 'H'),
+      ('e_phentsize', 'H'),
+      ('e_phnum', 'H'),
+      ('e_shentsize', 'H'),
+      ('e_shnum', 'H'),
+      ('e_shstrndx', 'H'),
+  )
+  ehdr = parse_struct(ehdr_fields, data[i : i + 0x34])
+  dump_struct(ehdr_fields, data[i : i + 0x34])  # !! Remove these calls.
+  i += 0x34
+
+  if ehdr['ei_mag'] != '\x7fELF':
+    raise ValueError
+  if ehdr['ei_class'] != 1:
+    raise ValueError
+  if ehdr['ei_data'] != 1:
+    raise ValueError
+  if ehdr['ei_version'] != 1:
+    raise ValueError
+  if ehdr['e_osabi'] not in (0, 3):  # 0: System V, 3: Linux.
+    raise ValueError
+  if ehdr['e_abiversion'] != 0:
+    raise ValueError
+  #if ehdr['e_pad'] != '\0\0\0\0\0\0\0':
+  #  raise ValueError
+  if ehdr['e_type'] != 2:
+    raise ValueError('Expected an executable file.')
+  if ehdr['e_machine'] != 3:  # x86.
+    raise ValueError('Expected i386.')
+  if ehdr['e_version'] != 1:
+    raise ValueError
+  if ehdr['e_ehsize'] != 0x34:
+    raise ValueError
+  if ehdr['e_phentsize'] != 0x20:
+    raise ValueError
+  if ehdr['e_flags'] != 0:
+    raise ValueError
+  if ehdr['e_shentsize'] not in (0, 0x28):
+    raise ValueError
+  if ehdr['e_shnum'] != 0:
+    raise ValueError
+  if ehdr['e_phnum'] not in (1, 2):
+    raise ValueError(
+        'Bad number of program header entries: %d' % ehdr['e_phnum'])
+  if ehdr['e_phoff'] != i:
+    raise ValueError
+
+  phdr_fields = (  # ELF program header.
+      ('p_type', 'L'),
+      ('p_offset', 'L'),
+      ('p_vaddr', 'L'),
+      ('p_paddr', 'L'),
+      ('p_filesz', 'L'),
+      ('p_memsz', 'L'),
+      ('p_flags', 'L'),
+      ('p_align', 'L'),
+  )
+  phdr = None
+  for phi in xrange(ehdr['e_phnum']):
+    phdri = parse_struct(phdr_fields, data[i : i + 0x20])
+    dump_struct(phdr_fields, data[i : i + 0x20])
+    i += 0x20
+    if phdri['p_memsz'] != 0:
+      if phdr is not None:
+        raise ValueError('Too many phdrs.')
+      phdr = phdri
+  elf_hdr_size = i
+  print 'load_addr = 0x%x' % load_addr
+
+  if phdr is None:
+    raise ValueError('Missing phdr.')
+  if phdr['p_type'] != 1:  # PT_LOAD.
+    raise ValueError
+  if phdr['p_memsz'] != phdr['p_filesz']:
+    raise ValueError
+  if phdr['p_vaddr'] != phdr['p_paddr']:
+    raise ValueError
+  if phdr['p_memsz'] == 0:
+    raise ValueError
+  if phdr['p_offset'] != 0:
+    raise ValueError
+  # !! Where is the base vaddr 0x00c01000 specified in the UPX sources? Can it change if we make the load_addr smaller?
+  
+  # Based on PackLinuxElf64::unpack in p_lx_elf.cpp and p_unix.h .
+  # !! Check.
+  l_info_fields = (  # 12-byte trailer in header for loader
+      ('l_checksum', 'L'),  # TODO(pts): Check this. (It doesn't seem to match.)
+      ('l_magic', '4s'),  # UPX_MAGIC_LE32 == 'UPX!'.
+      ('l_lsize', 'H'),  # Decompressor stub size (?). 0x818 for ls.c32, 0x1200 for lua.c32.
+      ('l_version', 'B'),  # Must be at least 10, getVersion() returns 13.
+      ('l_format', 'B'),  # UPX_F_LINUX_ELF_i386 == 12.
+  )
+  l_info = parse_struct(l_info_fields, data[i : i + 12])
+  dump_struct(l_info_fields, data[i : i + 12])  # !! Remove these calls.
+  i += 12
+
+  if l_info['l_magic'] != 'UPX!':
+    raise ValueError('Bad l_magic.')
+  if l_info['l_format'] != 12:
+    raise ValueError('Bad l_format.')
+  if not 10 <= l_info['l_version']  <= 14:
+    raise ValueError('Unsupported l_version: %d' % l_info['l_version'])
+
+  p_info_fields = (  # 12-byte packed program header.
+      ('p_progid', 'L'),
+      ('p_filesize', 'L'),  # len(code) + 0x54
+      ('p_blocksize', 'L'),
+  )
+  p_info = parse_struct(p_info_fields, data[i : i + 12])
+  dump_struct(p_info_fields, data[i : i + 12])
+  i += 12
+
+  if p_info['p_progid']:
+    raise ValueError('Bad p_progid.')
+  if p_info['p_filesize'] != len(code) + 0x54:
+    raise ValueError
+  if p_info['p_blocksize'] != len(code) + 0x54:
+    raise ValueError
+
+  data_b_info = None
+  c_adler32 = 1  # zlib.adler32('').
+  for _ in xrange(2):  # Why 2 sections? The real data is in the 2nd one.
+    # !! lots of filters (b_ftid) in filteri.cpp
+    # Packer::getDecompressorSections (contains NRV and LZMA)
+    # Method can be (for elf32):
+    # * with --small: (!! which is the default? which one is smaller? should we specify --small? also for bmcompress.py?)
+    #   * M_LZMA == 14: LZMA_ELF00,LZMA_DEC10,LZMA_DEC30.
+    #   * M_NRV2B_LE32 == 2: N2BSMA10,N2BDEC10,N2BSMA20,N2BDEC20,N2BSMA30,N2BDEC30,N2BSMA40,N2BSMA50,N2BDEC50,N2BSMA60,N2BDEC60.
+    #   * M_NRV2D_LE32 == 5: N2DSMA10,N2DDEC10,N2DSMA20,N2DDEC20,N2DSMA30,N2DDEC30,N2DSMA40,N2DSMA50,N2DDEC50,N2DSMA60,N2DDEC60.
+    #   * M_NRV2E_LE32 == 8: N2ESMA10,N2EDEC10,N2ESMA20,N2EDEC20,N2ESMA30,N2EDEC30,N2ESMA40,N2ESMA50,N2EDEC50,N2ESMA60,N2EDEC60.
+    # * without --small (fast) (!! why? 3 bytes extra output?):
+    #   * M_LZMA == 14 (lua.c32): LZMA_ELF00,LZMA_DEC20,LZMA_DEC30.
+    #   * M_NRV2B_LE32 == 2 (ls.c32): N2BFAS10,+80CXXXX,N2BFAS11,N2BDEC10,N2BFAS20,N2BDEC20,N2BFAS30,N2BDEC30,N2BFAS40,N2BFAS50,N2BDEC50,N2BFAS60,+40CXXXX,N2BFAS61,N2BDEC60.
+    #   * M_NRV2D_LE32 == 5: N2DFAS10,+80CXXXX,N2DFAS11,N2DDEC10,N2DFAS20,N2DDEC20,N2DFAS30,N2DDEC30,N2DFAS40,N2DFAS50,N2DDEC50,N2DFAS60,+40CXXXX,N2DFAS61,N2DDEC60.
+    #   * M_NRV2E_LE32 == 8: N2EFAS10,+80CXXXX,N2EFAS11,N2EDEC10,N2EFAS20,N2EDEC20,N2EFAS30,N2EDEC30,N2EFAS40,N2EFAS50,N2EDEC50,N2EFAS60,+40CXXXX,N2EFAS61,N2EDEC60.
+    # PackLinuxElf32x86::addStubEntrySections (both b_method and b_ftid)
+    #   LEXEC000 call main; decompress: ...
+    #   LXUNF000?
+    #   LXUNF002?
+    #   MRUBYTE0?
+    #   LXMRU005?
+    #   LXMRU006?
+    #   LXMRU007?
+    #   LXUNF008?
+    #   LXUNF010?
+    #   LEXEC009?
+    #   LEXEC010
+    #   calls addLoader(getDecompressorSections(), NULL);
+    #   LEXEC015
+    #   LXUNF042?
+    #   calls addFilter32(ft->id);? 
+    #   LXMRU058?
+    #   LXUNF035?
+    #   LEXEC017? (if no filter)
+    #   --- This is the end of the decompression code.
+    #   IDENTSTR  '\n\0$Info: This file is packed with the UPX executable packer http://upx.sf.net $\n\0$Id: UPX ' ... '3.94 Copyright (C) 1996-2017 the UPX Team. All Rights Reserved. $\n\0'
+    #   LEXEC020
+    #   LUNMP000?
+    #   LUNMP001?
+    #   LEXEC025
+    #   FOLDEXEC Patched and then compressed stub_i386_linux_elf_fold, without its first 128 bytes. The uncompressed version is typically 1630 bytes.
+    b_info_fields = (  # 12-byte header before each compressed block.
+        ('sz_unc', 'L'),  # Uncompressed size.
+        ('sz_cpr', 'L'),  # Compressed size.
+        ('b_method', 'B'),  # Compression algorithm.
+        ('b_ftid', 'B'),  # Filter ID.
+        ('b_cto8', 'B'),  # Filter parameter.
+        ('b_unused', 'B'),
+    )
+    b_info = parse_struct(b_info_fields, data[i : i + 12])
+    data_b_info = b_info  # The last.
+    dump_struct(b_info_fields, data[i : i + 12])
+    i += 12
+    b_info['c_ofs'] = i  # Compressed data starts here.
+    c_adler32 = zlib.adler32(buffer(data, i, b_info['sz_cpr']), c_adler32)
+    i += b_info['sz_cpr']
+  if data_b_info['sz_unc'] != len(code):
+    raise ValueError
+  if data_b_info['sz_cpr'] >= len(code):
+    raise ValueError('Compression not effective.')
+  compressed_data = buffer(data, data_b_info['c_ofs'], data_b_info['sz_cpr'])
+
+  i += (-i & 0x7)  # Round up to 16 bytes.
+  # Loader starts here at i (with ofsa).
+  ofsa, ofsb = struct.unpack('<LL', data[i : i + 8])
+  i += 8
+  loader_ofs = i
+  sizea = i - ofsa
+  print 'i = 0x%x' % i
+  # !! What are these offsets? Who emits them?
+  print 'ofsa = 0x%x' % ofsa
+  print 'ofsb = 0x%x' % ofsb
+  print 'sizea = 0x%x' % sizea
+  if i != (ehdr['e_entry'] - phdr['p_vaddr']):
+    raise ValueError(
+        'Bad entry point: i=0x%x ofs=0x%x' %
+        (i, ehdr['e_entry'] - phdr['p_vaddr']))
+  if i != ofsb + 4:
+    raise ValueError('Bad ofsb.')
+  if not 0 <= sizea < 0x200:  # Typically 0x8c. Why?
+    raise ValueError('Bad sizea.')
+  if data[i] != '\xe8':
+    raise ValueError('Bad loader start byte.')
+  if data_b_info['b_ftid'] != 0 and data[i + 5] != '\xeb':
+    raise ValueError('Bad decompress start byte.')
+  if (i - 8) + l_info['l_lsize'] == len(data) - 36 - 12:  # !! Why occasionally 12?
+    print 'FFF', tmp_filename
+
+  if ((i - 8) + l_info['l_lsize'] != len(data) - 36 - 8 and
+      (i - 8) + l_info['l_lsize'] != len(data) - 36 - 12):  # chain.c32
+    raise ValueError('Bad l_lsize: 0x%x vs 0x%x' % ((i - 8) + l_info['l_lsize'], len(data) - 36 - 8))
+  loader_data = data[i - 8 : i + l_info['l_lsize']]
+  #print 'LOADER'
+  ##i = 0
+  #for l_size in xrange(4600, 4700):
+  #  for j in xrange(-20, 200):
+  #    loader_data = data[i + j : i + j + l_size]
+  #    import zlib
+  #    if (zlib.adler32(loader_data, 1) & 0xffffffff) == (l_info['l_checksum'] & 0xffffffff):
+  #      print (l_size, j)  # !! l_checksum not found! Why??
+  #print '/LOADER'
+  i += l_info['l_lsize'] - 8
+  i = len(data) - 36 - 8
+
+  if data[i : i + 8] != 'UPX!\0\0\0\0':
+    raise ValueError('Bad signature after loader.')
+  i += 8
+
+  # PackHeader::putPackHeader called from pack4().
+  ph_fields = (  # PackHeader.
+      ('ph_alignment', '<0s'),
+      ('ph_magic', '4s'),
+      ('ph_version', 'B'),
+      ('ph_format', 'B'),
+      ('ph_method', 'B'),
+      ('ph_level', 'B'),  # Not stored anywhere else.
+      ('ph_u_adler', 'L'),
+      ('ph_c_adler', 'L'),
+      ('ph_u_len', 'L'),
+      ('ph_c_len', 'L'),
+      ('ph_u_file_size', 'L'),
+      ('ph_filter', 'B'),
+      ('ph_filter_cto', 'B'),
+      ('ph_n_mru1', 'B'),  # Not stored anywhere else.
+      ('ph_dummy', 'B'),
+  )
+  ph = parse_struct(ph_fields, data[i : i + 32])
+  dump_struct(ph_fields, data[i : i + 32])
+  overlay_offset, = struct.unpack('<L', data[i + 32 : i + 36])
+  print 'overlay_offset = 0x%x' % overlay_offset  # dump_struct. !!
+  i += 36
+  if i != len(data):
+    raise ValueError('Expected EOF on compressed ELF32 executable.')
+
+  if overlay_offset != elf_hdr_size + 12:
+    raise ValueError
+  if ph['ph_magic'] != 'UPX!':
+    raise ValueError('Bad l_magic.')
+  if ph['ph_version'] != l_info['l_version']:
+    raise ValueError
+  if ph['ph_format'] != l_info['l_format']:
+    raise ValueError
+  if ph['ph_method'] != data_b_info['b_method']:
+    raise ValueError
+  #if ph['ph_level'] != ...:  # Not stored anywhere else.
+  #  raise ValueError
+  if ph['ph_u_adler'] != (zlib.adler32(code, zlib.adler32(elf32_header)) & 0xffffffff):
+    raise ValueError
+  if ph['ph_c_adler'] != (c_adler32 & 0xffffffff):
+    raise ValueError
+  if ph['ph_u_len'] != data_b_info['sz_unc']:
+    raise ValueError
+  if ph['ph_c_len'] != len(compressed_data):
+    raise ValueError
+  if ph['ph_u_file_size'] != 0x54 + len(code):
+    raise ValueError
+  if ph['ph_filter'] != data_b_info['b_ftid']:
+    raise ValueError
+  if ph['ph_filter_cto'] != data_b_info['b_cto8']:
+    raise ValueError
+#    raise ValueError
+  #if ph['ph_n_mru1'] != ...:  # Not stored anywhere else.
+  #  raise ValueError
+  #os.unlink(tmp_filename)
+
+  i = data.find('\n\0$Info: This file is packed with the UPX executable packer http://upx.sf.net $\n\0$Id: UPX ', loader_ofs)
+  if i < 0:
+    raise ValueError
+  def to_byte(s):
+    return '.byte %s\n' % ','.join(str(ord(c)) for c in s)
+  output = [
+      '.text\n',
+      '.globl decompress\n',
+      'decompress:\n',
+      to_byte(data[loader_ofs + 5 : loader_ofs + 7]),
+      '.global lxunfilter\n',
+      'lxunfilter:\n',
+      to_byte(data[loader_ofs + 7 : i]),
+      '.rodata\n',
+      '.globl compressed_data\n',
+      '.compressed_data:\n',
+      to_byte(compressed_data),
+      '.globl b_method\n',
+      'b_method:\n',
+      '.byte %d\n' % data_b_info['b_method'],
+      '.globl b_ftid\n',
+      'b_ftid:\n',
+      '.byte %d\n' % data_b_info['b_ftid'],
+      '.globl b_cto8\n',
+      'b_cto8:\n',
+      '.byte %d\n' % data_b_info['b_cto8'],
+      '.globl sz_unc\n',
+      'sz_unc:\n',
+      '.long %d\n' % data_b_info['sz_unc'],
+  ]
+  open('deco.s', 'w').write(''.join(output))
+  open('deco.h', 'w').write(
+      'void lxunfilter(char *p, unsigned s, unsigned cto8, unsigned ftid);\n'
+      'int decompress(const char *inp, unsigned ins, char *outp, unsigned *outs, unsigned params);\n'
+      'extern unsigned char b_method, b_ftid, b_cto8;\n'
+      'extern unsigned sz_unc;\n')
+
+
+def main(argv):
+  for filename in argv[1:]:
+    print >>sys.stderr, 'info: compressing: %s' % filename
+    code = open(filename, 'rb').read()
+    tmp_filename = filename + '.tmp'
+    code = bmcompress32(code, None, tmp_filename)
+  #open(tmp_filename, 'wb').write(code)
+
+
+if __name__ == '__main__':
+  sys.exit(main(sys.argv))
+  
