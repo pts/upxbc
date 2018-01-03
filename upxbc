@@ -699,6 +699,7 @@ def bmcompress32_asm(udata, tmp_filename, method='--ultra-brute', prefix_size=0)
     return '.byte %s\n' % ','.join(str(ord(c)) for c in s)
 
   output = [
+      '/* smart_decompress_size = %d */\n' % len(smart_decompress_code),
       '.text\n',
       '.globl prefix_data\n',
       'prefix_data:\n',
@@ -725,6 +726,26 @@ def bmcompress32_asm(udata, tmp_filename, method='--ultra-brute', prefix_size=0)
       'extern const char prefix_data[];\n'
       'extern const char prefix_data_end[];\n')))
 
+  if ch.ubufsize < 0x23:
+    raise ValueError  # !! Doesn't work for too short output, move in wrong direction.
+  output = [
+      udata[:prefix_size],
+      '\xe8\x00\x00\x00\x00',
+      '\x5b',
+      struct.pack('<1sL', '\xb9', len(smart_decompress_code)),
+      '\x8d\x74\x0b\x1d',
+      struct.pack('<2sL', '\x8d\xbe', ch.ubufsize - 0x23),
+      '\x41',
+      '\xfd',
+      '\xf3\xa4',
+      '\xfc',
+      '\x8d\x43\xfb',
+      '\x50',
+      struct.pack('<1sL', '\xe9', ch.ubufsize - 0x23),
+      smart_decompress_code,
+  ]
+  open('compr.c32', 'wb').write(''.join(output))
+
   # !! Get new stats, with details on len(decompress_code) etc.
   # method=M_LZMA filter=0 decompress_size=2835
   # --small method=M_LZMA filter=0 decompress_size=2858
@@ -738,6 +759,7 @@ def bmcompress32_asm(udata, tmp_filename, method='--ultra-brute', prefix_size=0)
 
 def main(argv):
   prefix_size = 7  # !!
+  prefix_size = 5  # !! .c32 signature.
   for filename in argv[1:]:
     print >>sys.stderr, 'info: compressing: %s' % filename
     code = open(filename, 'rb').read()
