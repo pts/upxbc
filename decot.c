@@ -1,10 +1,18 @@
-/* $ xstatic gcc -s -Os -Wl,-N -W -Wall -Wextra -Werror -o decot deco.s decot.c && ./decot >decot.out */
+/*
+ * decot.c: Example C program to execute smart_decompress.
+ *
+ * $ xstatic gcc -s -Os -Wl,-N -W -Wall -Wextra -Werror -o decot deco.s decot.c && ./decot >decot.out
+ */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
-#include "deco.h"
+void smart_decompress(char *outp) __attribute__((regparm(3)));
+extern unsigned ubufsize;
+extern const unsigned uncompressed_data_size;
+extern const char prefix_data[];
+extern const char prefix_data_end[];
 
 int main(int argc, char **argv) {
   char *outp;

@@ -1,5 +1,19 @@
-#! /usr/bin/python
+#! /bin/sh
 # by pts@fazekas.hu at Sun Dec 31 19:21:00 CET 2017
+
+""":" #upxbc: UPX-based compressor for execuables and data files
+
+type python2.7 >/dev/null 2>&1 && exec python2.7 -- "$0" ${1+"$@"}
+type python2.6 >/dev/null 2>&1 && exec python2.6 -- "$0" ${1+"$@"}
+type python2.5 >/dev/null 2>&1 && exec python2.5 -- "$0" ${1+"$@"}
+type python2.4 >/dev/null 2>&1 && exec python2.4 -- "$0" ${1+"$@"}
+exec python -- ${1+"$@"}; exit 1
+
+This script need Python 2.5, 2.6 or 2.7. Python 3.x won't work. Python 2.4
+typically won't work (unless the hashlib module is installed from PyPi).
+
+Typical usage: upxbc --c32 input.c32 output.c32
+"""
 
 import os
 import os.path
@@ -368,6 +382,34 @@ def build_elf32_for_upx_decompression(
   return ''.join(output)
 
 
+def get_upx_method_args(method):
+  if not method:
+    method = '--ultra-brute'
+    #method = '--best --nrv2b'  # Doesn't select with --brute or --ultrabrute.
+    #method = '--best --nrv2d'  # Doesn't select with --brute or --ultrabrute.
+    #method = '--best --nrv2e'  # Doesn't select with --brute or --ultrabrute.
+    #method = '--best --small'  # !!  --small also avoids some nops.
+    #method = '--best'
+    #method = '--ultra-brute --small'  # !!
+    #method = '--lzma --small'   # This can force LZMA.
+    #method = '-9'
+    #method = '--ultra-brute --small --no-filter'  # !!
+    #method = '--none'
+  if isinstance(method, str):
+    method = method.replace(',', ' ').split()
+  method = ['-' * (1 + (arg not in '123456789')) + arg for arg in
+            (arg.strip('-') for arg in method) if arg]
+  # Example good: '--best'. Doesn't enable LZMA.
+  # Example good: '--brute'. Also enables LZMA.
+  # Example good: '--ultra-brute'. Also enables LZMA.
+  # Example good: '--ultra-brute --lzma'.
+  if method == ['--no-lzma']:
+    method[:] = ('--best', '--no-lzma')
+  if not method:
+    method.append('--ultra-brute')
+  return method
+
+
 def upx_compress32(udata, tmp_filename, method=None, need_decompress_code=False):
   """Compresses !! write docstring
 
@@ -387,31 +429,11 @@ def upx_compress32(udata, tmp_filename, method=None, need_decompress_code=False)
   """
   if not isinstance(udata, (str, buffer)):
     raise TypeError
-  if method is None:
-    method = '--ultra-brute'
-  #method = '--best --nrv2b'  # Doesn't select with --brute or --ultrabrute.
-  #method = '--best --nrv2d'  # Doesn't select with --brute or --ultrabrute.
-  #method = '--best --nrv2e'  # Doesn't select with --brute or --ultrabrute.
-  #method = '--best --small'  # !!  --small also avoids some nops.
-  #method = '--best'
-  #method = '--ultra-brute --small'  # !!
-  #method = '--lzma --small'   # This can force LZMA.
-  #method = '-9'
-  #method = '--ultra-brute --small --no-filter'  # !!
-  #method = '--none'
-  method = ['-' * (1 + (arg not in '123456789')) + arg for arg in
-            (arg.strip('-') for arg in method.replace(',', ' ').split()) if arg]
-  if not method or method == ['--none']:
-    return upx_make_uncompressed(udata)
-
-  # Example good: '--best'. Doesn't enable LZMA.
-  # Example good: '--brute'. Also enables LZMA.
-  # Example good: '--ultra-brute'. Also enables LZMA.
-  # Example good: '--ultra-brute --lzma'.
-  if not method:
-    method.append('--ultra-brute')
+  method = get_upx_method_args(method)
   has_lzma = '--brute' in method or '--ultra-brute' in method or '--lzma' in method
   method[:] = [arg for arg in method if arg != '--small']
+  if '--none' in method:
+    return upx_make_uncompressed(udata)
   if not has_lzma:
     # --small makes M_LZMA larger (!) by 23 bytes, so we don't apply it.
     # It also makes the M_NRV2A_LE16 a few dozen bytes smaller (avoiding NOPs etc),
@@ -763,7 +785,7 @@ def upx_compress32(udata, tmp_filename, method=None, need_decompress_code=False)
   ph = parse_struct(ph_fields, data[i : i + 32])
   dump_struct(ph_fields, data[i : i + 32])
   overlay_ofs, = struct.unpack('<L', data[i + 32 : i + 36])
-  print 'overlay_ofs = 0x%x' % overlay_ofs  # dump_struct. !! Make it optional.
+  print 'overlay_ofs = 0x%x' % overlay_ofs  # dump_struct. !! Make it optional (e.g. -v for verbose).
   i += 36
   if i != len(data):
     raise ValueError('Expected EOF on compressed ELF32 executable.')
@@ -1013,7 +1035,7 @@ def get_smart_decompress_code(ch, udata=None):
   return ch, code
 
 
-def compress_bm32(udata, tmp_filename, method=None, prefix_size=0):
+def compress_flat32(udata, tmp_filename, method=None, prefix_size=0):
   """Compresses a position-independent executable !! write docstring"""
   if not isinstance(udata, (str, buffer)):
     raise TypeError
@@ -1026,7 +1048,6 @@ def compress_bm32(udata, tmp_filename, method=None, prefix_size=0):
     # Output too short, `rep movsb' would move in the wrong direction below.
     # Just keep it uncompressed.
     return udata
-  #assert 0, [ch.decompress_code]
   ch, smart_decompress_code = get_smart_decompress_code(ch, udata_after_prefix)
   data = ''.join((  # Based on move_smart_decompress.nasm .
       udata[:prefix_size],
@@ -1055,10 +1076,44 @@ def compress_c32(udata, tmp_filename, method=None):
        udata[40 : 47] == '\xe8\x00\x00\x00\x00\x92\x58')):
     # Already compressed by compress_c32.
     return udata
-  return compress_bm32(udata, tmp_filename, method, prefix_size=5)
+  return compress_flat32(udata, tmp_filename, method, prefix_size=5)
 
 
-def compress_bm32_to_asm(udata, tmp_filename, method=None, prefix_size=0):
+def compress_with_upx(udata, tmp_filename, method=None, do_decompress=False):
+  open(tmp_filename, 'wb').write(udata)
+  os.chmod(tmp_filename, 0700)  # UPX needs an executable.
+  cmd = [get_upx_prog(), '-qq']
+  if do_decompress:
+    cmd.append('-d')
+  else:
+    method = get_upx_method_args(method)
+    if '--none' in method:
+      raise ValueError('UPX does not support --none')
+    cmd.extend(method)
+  cmd.extend(('--', tmp_filename))
+  print >>sys.stderr, 'info: running UPX: %s' % (
+      ' ' .join(map(pipes.quote, cmd)))
+  try:
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+  except OSError:
+    os.unlink(tmp_filename)
+    raise RuntimeError('UPX not found: %x' % cmd[0])
+  try:
+    upx_stdout, upx_stderr = p.communicate('')
+  finally:
+    exit_code = p.wait()
+  if exit_code:
+    os.unlink(tmp_filename)
+    sys.stderr.write(upx_stderr)
+    raise RuntimeError('UPX failed with exit_code=0x%x.' % exit_code)
+  # Don't print upx_stdout, it just contains statistics as a one-liner.
+  data = open(tmp_filename, 'rb').read()
+  os.unlink(tmp_filename)
+  return data
+
+
+def compress_flat32_to_asm(udata, tmp_filename, method=None, prefix_size=0):
   """Compresses !! write docstring"""
   if not isinstance(udata, (str, buffer)):
     raise TypeError
@@ -1093,8 +1148,8 @@ def compress_bm32_to_asm(udata, tmp_filename, method=None, prefix_size=0):
   ))
 
 
-def main(argv):
-  data = compress_bm32_to_asm(open('example_text.c32', 'rb').read(), 't.tmp', prefix_size=19)
+def example():
+  data = compress_flat32_to_asm(open('example_text.c32', 'rb').read(), 't.tmp', prefix_size=19)
   open('deco.s', 'w').write(data)
   # See decot.c for running the decompressor.
   # $ xstatic gcc -s -Os -Wl,-N -W -Wall -Werror -o decot decot.c deco.s && ./decot >decot.out
@@ -1103,7 +1158,6 @@ def main(argv):
   #data = compress_c32(open('a.c32', 'rb').read(), 't.tmp')
   data = compress_c32(open('../../tinyc32/examples/hello_long.c32', 'rb').read(), 't.tmp')
   open('a.c32', 'wb').write(data)
-  #return
 
   prefix_size = 7  # !!
   #prefix_size = 0
@@ -1113,8 +1167,162 @@ def main(argv):
     print >>sys.stderr, 'info: compressing: %s' % filename
     code = open(filename, 'rb').read()
     tmp_filename = filename + '.tmp'
-    compress_bm32(code, tmp_filename, prefix_size=prefix_size, method=method)
+    compress_flat32(code, tmp_filename, prefix_size=prefix_size, method=method)
   #open(tmp_filename, 'wb').write(code)
+
+
+def detect_input_format(udata, input_format):
+  signature = udata[:5]
+  if not signature:
+    detected_format = 'empty'
+  elif signature.startswith('\xb8\xfeL\xcd!'):
+    detected_format = 'c32'
+  elif signature.startswith('\x7fELF'):
+    detected_format = 'elf'
+  elif signature.startswith('MZ'):
+    detected_format = 'exe'
+  elif signature.startswith('UPXZ'):
+    detected_format = 'upxz'
+  elif input_format is None:
+    return 'unknown'
+  else:
+    return input_format
+
+  if input_format is None:
+    return detected_format
+  if input_format != detected_format and input_format not in (
+      'binary', 'flat32'):
+    raise ValueError('Input format mismatch: detected %s, asked %s' %
+                     (detected_format, input_format))
+  return input_format
+
+
+def main(argv):
+  input_file = None
+  output_file = None
+  do_decompress = False
+  method_args = []
+  input_format = None
+  output_format = None
+  prefix_size = None
+  do_check_decompress = False
+
+  if len(argv) < 2 or argv[1] == '--help':
+    sys.stderr.write('Usage: %s [<flag>...] <input-file> <output-file>\n' % argv[0])
+    sys.exit(0)
+    # TODO(pts): Document command-line flags.
+
+  i = 1
+  while i < len(argv):
+    arg = argv[i]
+    i += 1
+    if arg == '--':
+      break
+    if arg == '-' or not arg.startswith('-'):
+      i -= 1
+      break
+    arg = '--' + arg.lstrip('-')
+    if len(arg) == 3 and arg[2] in '123456789':
+      method_args.append(arg[1:])
+    elif arg in ('--best', '--brute', '--ultra-brute', '--lzma', '--no-lzma',
+                 '--nrv2b', '--nrv2d', '--nrv2e', '--small', '--none',
+                 '--no-filter', '--all-filters', '--all-methods'):
+      method_args.append(arg)
+    elif arg in ('--q', '--qq', '--qqq'):
+      pass  # !! Make this flag useful.
+    elif arg in ('--d', '--decompress', '--uncompress'):
+      do_decompress = True
+    elif arg == '--check':
+      do_check_decompress = True
+    elif arg == '--c32':
+      input_format = 'c32'  # Superfluous, can be autodetected.
+    elif arg == '--upxz':
+      output_format = 'upxz'
+    elif arg.startswith('--prefix='):
+      prefix_size = int(arg.split('=', 1)[1], 0)
+    elif arg.startswith('--in='):
+      input_file = arg.split('=', 1)[1]
+    elif arg.startswith('--out='):
+      output_file = arg.split('=', 1)[1]
+    elif arg in ('-S', '--asm'):
+      output_format = 'asm'
+    else:
+      sys.exit('fatal: unknown command-line flag: %s' % arg)
+  if input_file is None and i < len(argv):
+    input_file = argv[i]
+    i += 1
+  if output_file is None and i < len(argv):
+    output_file = argv[i]
+    i += 1
+  if input_file is None:
+    sys.exit('fatal: missing <input-file>')
+  if output_file is None:
+    sys.exit('fatal: missing <output-file>')
+  if i != len(argv):
+    sys.exit('fatal: too many command-line arguments')
+
+  method = ' '.join(method_args)
+  tmp_filename = output_file + '.tmp'
+  if input_format is None and output_format == 'asm':
+    input_format = 'flat32'
+  if (input_format is None and output_format is None and
+      prefix_size is not None):
+    input_format = 'flat32'
+  if output_format == 'upxz' and input_format is None:
+    if do_decompress:
+      input_format, output_format = 'upxz', 'binary'
+    else:
+      input_format = 'binary'
+  udata = open(input_file, 'rb').read()
+  input_format = detect_input_format(udata, input_format)
+  print >>sys.stderr, (
+      'info: read input: %s (%d bytes, format %s)' %
+      (input_file, len(udata), input_format))
+  if output_format is None:
+    if input_format == 'upxz' and do_decompress:
+      output_format = 'binary'
+    else:
+      output_format = input_format
+  if prefix_size and input_format != 'flat32':
+    sys.exit('fatal: --prefix= not supported by input format: %s' %
+             input_format)
+  if do_decompress and input_format not in ('upxz', 'elf', 'exe'):
+    sys.exit('fatal: --decompress not supported by input format: %s' %
+             input_format)
+  if input_format == output_format == 'flat32':
+    data = compress_flat32(
+        udata, tmp_filename, method=method, prefix_size=(prefix_size or 0))
+  elif input_format == 'flat32' and output_format == 'asm':
+    data = compress_flat32_to_asm(
+        udata, tmp_filename, method=method, prefix_size=(prefix_size or 0))
+  elif input_format == output_format == 'c32':
+    data = compress_c32(udata, tmp_filename, method=method)
+  elif (input_format == 'binary' and output_format == 'upxz' and
+        not do_decompress):
+    data = compress_upxz(udata, tmp_filename, method=method,
+                         do_check_decompress=do_check_decompress)
+  elif (input_format == 'upxz' and output_format == 'binary' and
+        do_decompress):
+    data = decompress_upxz(udata, tmp_filename)
+  elif input_format == output_format and input_format in ('elf', 'exe'):
+    data = compress_with_upx(
+        udata, tmp_filename, method=method, do_decompress=do_decompress)
+  elif input_format == output_format == 'unknown':
+    sys.exit(
+        'fatal: failed to detect input format, specify any of: '
+        '--c32 --upxz --asm --prefix=...')
+  else:
+    sys.exit(
+        'fatal: unsupported combination of '
+        'input format %s and output format %s' %
+        (input_format, output_format))
+  if do_decompress:
+    print >>sys.stderr, 'info: writing uncompressed output: %s (%d bytes, format %s)' % (
+        output_file, len(data), output_format)
+  else:
+    print >>sys.stderr, 'info: writing compressed output: %s (%d bytes, format %s)' % (
+        output_file, len(data), output_format)
+  open(output_file, 'wb').write(data)
 
 
 if __name__ == '__main__':
