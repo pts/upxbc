@@ -634,6 +634,13 @@ def bmcompress32_asm(udata, tmp_filename, method='--ultra-brute', prefix_size=0)
       to_byte(buffer(udata, 0, prefix_size)),
       '.globl prefix_data_end\n',
       'prefix_data_end:\n',
+      '.globl uncompressed_data_size\n',
+      'uncompressed_data_size:  /* must be directly in front of compressed_data */\n'
+      '.long %d\n' % (len(udata) - prefix_size),
+      '.globl ubufsize\n'
+      # Can be larger than len(udata) by padding_size.
+      'ubufsize:  /* must be directly in front of uncompressed_data_size */\n',
+      '.long %d\n' % ch.ubufsize,
       '.globl smart_decompress\n',
       'smart_decompress:\n',
   ]
@@ -656,8 +663,8 @@ def bmcompress32_asm(udata, tmp_filename, method='--ultra-brute', prefix_size=0)
         '.byte 0x52\n'
         # 00000010  680A000000        push dword 0xa
         '.byte 0x68; .long %d\n' % len(ch.compressed_data),
-        # 00000015  83C008            add eax,byte +0x8
-        '.byte 0x83, 0xc0, 0x08\n'
+        # 00000015  83C004            add eax,byte +0x4  # Skip over ubufsize.
+        '.byte 0x83, 0xc0, 0x04\n'
         # 00000018  50                push eax
         '.byte 0x50\n'
         # 00000019  E81B000000        call dword 0x39  # decompress
@@ -696,10 +703,10 @@ def bmcompress32_asm(udata, tmp_filename, method='--ultra-brute', prefix_size=0)
         # 00000033  C3                ret
         '.byte 0xc3\n'
         # 00000034  5550587E          db 'UPX~'
-        '.byte \'U\', \'P\', \'X\', \'~\'\n'
+        '.byte \'U\', \'P\', \'X\', \'~\'\n',
         # 00000038  (EOF)
-        '.globl lxunfilter\n',
-        'lxunfilter:  /* must come directly after the end of smart_decompress */\n',
+        #'.globl lxunfilter\n',
+        #'lxunfilter:  /* must come directly after the end of smart_decompress */\n',
         to_byte(ch.unfilter_code),  # !! Is .lstrip('\x90') safe here? .rstrip('\0') isn't safe, because it ruins the relative offsets.
     ))
   else:
@@ -718,8 +725,8 @@ def bmcompress32_asm(udata, tmp_filename, method='--ultra-brute', prefix_size=0)
         '.byte 0x52\n'
         # 0000000E  680A000000        push dword 0xa
         '.byte 0x68; .long %d\n' % len(ch.compressed_data),
-        # 00000013  83C008            add eax,byte +0x8
-        '.byte 0x83, 0xc0, 0x08\n'
+        # 00000013  83C004            add eax,byte +0x4  # Skip over ubufsize.
+        '.byte 0x83, 0xc0, 0x04\n'
         # 00000016  50                push eax
         '.byte 0x50\n'
         # 00000017  E80F000000        call dword 0x2b  # decompress
@@ -750,30 +757,27 @@ def bmcompress32_asm(udata, tmp_filename, method='--ultra-brute', prefix_size=0)
   # !! Handle if compressed data is not smaller than the original (in .c32).
 
   output.extend((
-      '.globl decompress\n'
-      'decompress:\n',
+      #'.globl decompress\n'
+      #'decompress:\n',
       to_byte(ch.decompress_code),
-      '.globl ubufsize\n'
+      #'.globl ubufsize_internal\n'
       # Can be larger than len(udata) by padding_size.
-      'ubufsize:  /* must be directly in front of uncompressed_data_size */\n',
+      #'ubufsize_internal:  /* must be directly in front of uncompressed_data_size */\n',
       '.long %d\n' % ch.ubufsize,
-      '.globl uncompressed_data_size\n',
-      'uncompressed_data_size:  /* must be directly in front of compressed_data */\n'
-      '.long %d\n' % (len(udata) - prefix_size),
-      '.globl compressed_data\n',
-      'compressed_data:\n',
+      #'.globl compressed_data\n',
+      #'compressed_data:\n',
       to_byte(ch.compressed_data),
   ))
   open('deco.s', 'w').write(''.join(output))
   open('deco.h', 'w').write(''.join((
-      'void lxunfilter(char *p, unsigned s, unsigned cto8 /*, unsigned ftid */ ) __attribute__((regparm(0)));\n'
-      'int decompress(const char *inp, unsigned ins, char *outp, unsigned *outs  /* , unsigned params */) __attribute__((regparm(0)));\n'
+      '//void lxunfilter(char *p, unsigned ubufsize, unsigned cto8 /*, unsigned ftid */ ) __attribute__((regparm(0)));\n'
+      '//int decompress(const char *inp, unsigned ins, char *outp, unsigned *ubufsizep  /* , unsigned params */) __attribute__((regparm(0)));\n'
       'void smart_decompress(char *outp) __attribute__((regparm(3)));\n'
       'extern unsigned ubufsize;\n'
       'extern const unsigned uncompressed_data_size;\n'
       'extern const char prefix_data[];\n'
       'extern const char prefix_data_end[];\n'
-      'extern const char compressed_data[];\n')))
+      '//extern const char compressed_data[];\n')))
 
   # !! Get new stats, with details on len(decompress_code) etc.
   # method=M_LZMA filter=0 decompress_size=2835
