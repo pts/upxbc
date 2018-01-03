@@ -179,9 +179,8 @@ def upx_make_uncompressed(udata):
       filter=0,
       filter_cto=0,
       compressed_data=str(udata),
-      ubufsize=str(udata),
-      # Based on decompress_none.nasm
-      # !! Test it.
+      ubufsize=len(udata),
+      # Based on decompress_none.nasm .
       decompress_code='\x8bD$\x10\x8b\x009D$\x08t\x04\x83\xc8\xff\xc3VW\x8bt$\x0c\x8b|$\x14\x91\xf3\xa4_^1\xc0\xc3',
       unfilter_code='\xc3',  # ret.
   )
@@ -376,7 +375,7 @@ def upx_compress32(udata, tmp_filename, method='--ultra-brute'):
     raise ValueError
   # TODO(pts): Where is the base vaddr 0x00c01000 specified in the UPX sources?
   #            Can it change if we make the load_addr smaller?
-  
+
   # Based on PackLinuxElf64::unpack in p_lx_elf.cpp and p_unix.h .
   l_info_fields = (  # 12-byte trailer in header for loader
       ('l_checksum', 'L'),  # TODO(pts): Check this adler32. (It doesn't seem to match.)
@@ -443,7 +442,7 @@ def upx_compress32(udata, tmp_filename, method='--ultra-brute'):
     #   calls addLoader(getDecompressorSections(), NULL);
     #   LEXEC015
     #   LXUNF042?
-    #   calls addFilter32(ft->id);? 
+    #   calls addFilter32(ft->id);?
     #   LXMRU058?
     #   LXUNF035?
     #   LEXEC017? (if no filter)
@@ -614,20 +613,19 @@ def upx_compress32(udata, tmp_filename, method='--ultra-brute'):
   )
 
 
-
 def bmcompress32_asm(udata, tmp_filename, method='--ultra-brute', prefix_size=0):
   """Compresses !! write docstring"""
   if not isinstance(udata, (str, buffer)):
     raise TypeError
   if len(udata) < prefix_size:
     raise ValueError('Uncompressed data too short.')
+  #method = 'none'  # !!
   ch = upx_compress32(buffer(udata, prefix_size), tmp_filename, method)
 
   def to_byte(s):
     return '.byte %s\n' % ','.join(str(ord(c)) for c in s)
 
   output = [
-      '/* decompressor_size = %d */\n' % (len(ch.unfilter_code * (ch.filter != 0)) + len(ch.decompress_code)),
       '.text\n',
       '.globl prefix_data\n',
       'prefix_data:\n',
@@ -645,7 +643,7 @@ def bmcompress32_asm(udata, tmp_filename, method='--ultra-brute', prefix_size=0)
       'smart_decompress:\n',
   ]
   if ch.filter != 0:
-    output.extend((
+    output.extend((  # Based on smart_decompress_filter.nasm .
         # 00000000  E800000000        call dword 0x5
         '.byte 0xe8; .long 0\n'
         # .after_call_next:
@@ -708,8 +706,12 @@ def bmcompress32_asm(udata, tmp_filename, method='--ultra-brute', prefix_size=0)
         #'.globl lxunfilter\n',
         #'lxunfilter:  /* must come directly after the end of smart_decompress */\n',
         to_byte(ch.unfilter_code),  # !! Is .lstrip('\x90') safe here? .rstrip('\0') isn't safe, because it ruins the relative offsets.
+        to_byte(ch.decompress_code),
     ))
-  else:
+  elif ch.format == 0:  # Shortcut (not needed), based on smart_decompress_none.nasm .
+    # Total overhead: 23 bytes, including ubufsize_internal (4 bytes).
+    output.append(to_byte('VW\xe8\x00\x00\x00\x00\x97^\x83\xc6\x0c\xad\x91\xf3\xa4_^\xc3'))
+  else:  # Based on smart_decompress.nasm .
     output.extend((
         # 00000000  E800000000        call dword 0x5
         '.byte 0xe8; .long 0\n'
@@ -750,8 +752,9 @@ def bmcompress32_asm(udata, tmp_filename, method='--ultra-brute', prefix_size=0)
         # 00000026  C3                ret
         '.byte 0xc3\n'
         # 00000027  5550587E          db 'UPX~'
-        '.byte \'U\', \'P\', \'X\', \'~\'\n'
+        '.byte \'U\', \'P\', \'X\', \'~\'\n',
         # 0000002B  (EOF)
+        to_byte(ch.decompress_code),
     ))
 
   # !! Handle if compressed data is not smaller than the original (in .c32).
@@ -759,7 +762,6 @@ def bmcompress32_asm(udata, tmp_filename, method='--ultra-brute', prefix_size=0)
   output.extend((
       #'.globl decompress\n'
       #'decompress:\n',
-      to_byte(ch.decompress_code),
       #'.globl ubufsize_internal\n'
       # Can be larger than len(udata) by padding_size.
       #'ubufsize_internal:  /* must be directly in front of uncompressed_data_size */\n',
