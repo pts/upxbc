@@ -31,8 +31,8 @@ def dump_struct(fields, data):
 def get_elf32_header(len_data, load_addr=0x8048000):
   # ELF 32-bit LSB  executable, Intel 80386, version 1 (GNU/Linux), statically linked, stripped.
   # Contains ELF EHDR and 1 PHDR (program header).
-  if load_addr & 0xff:
-    raise ValueError('load_addr not aligned.')  # What would break?
+  if load_addr & 0xff:  # It would work even without alignment. Just for sanity.
+    raise ValueError('load_addr not aligned.')
   return ''.join((  # 0x54 bytes.
       '\x7fELF\x01\x01\x01\x03\0\0\0\0\0\0\0\0\x02\0\x03\0\x01\0\0\0',
       struct.pack('<L', load_addr + 0x54),  # e_entry.
@@ -42,13 +42,14 @@ def get_elf32_header(len_data, load_addr=0x8048000):
       '\x07\0\0\0\x01\0\0\0'))
 
 
-def run_upx_elf32(code, load_addr, tmp_filename, method, padding_char, padding_size):
-  if not isinstance(code, str):
+def run_upx_elf32(code, tmp_filename, method, padding_char, padding_size):
+  if not isinstance(code, (str, buffer)):
     raise TypeError
   if not isinstance(method, (list, tuple)):
     raise TypeError
-  if load_addr is None:
-    load_addr = 0x8048000
+  # Doesn't make a difference in UpxCompressed, using a small value.
+  #load_addr = 0x8048000
+  load_addr = 0x200
 
   elf32_size = 0x54 + len(code) + padding_size
   elf32_header = get_elf32_header(elf32_size - 0x54, load_addr)
@@ -98,22 +99,121 @@ def run_upx_elf32(code, load_addr, tmp_filename, method, padding_char, padding_s
   return elf32_size, zlib.adler32(elf32_header)
 
 
-def bmcompress32(code, load_addr, tmp_filename, method='--ultra-brute', signature_start_ofs_max=0):
-  """!! write docstring"""
-  if not isinstance(code, str):
-    raise TypeError
-  if load_addr is None:
-    load_addr = 0x8048000
+class UpxCompressed(object):
+  """Data compressed by UPX."""
+  # Not using collections.namedtuple because of Python 2.4 compatibility.
 
-  if not method or method == '--none':
-    return code  # Keep it uncompressed.
+  # Possible values of self.format, defined in src/conf.h in UPX.
+  M_NONE = 0  # Not defined by UPX.
+  M_NRV2B_LE32 = 2
+  M_NRV2D_LE32 = 5
+  M_NRV2E_LE32 = 8
+  M_LZMA = 14
+
+  __slots__ = (
+      # Compression method (algorithm) identifier, one one
+      # M_NONE (0), M_NRV2B_LE32 (2), M_NRV2D_LE32 (5, rare),
+      # M_NRV2E_LE32 (8, rare), M_LZMA (14).
+      'format',
+      # 0 means no filter, i.e. unfilter doesn't have to be applied after
+      # decompress.
+      #
+      # Possible values (from src/filteri.cpp):
+      # 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
+      # 0x0b, 0x0c, 0x0d, 0x0e, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+      # 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x24, 0x25, 0x26, 0x36,
+      # 0x46, 0x49, 0x50, 0x51, 0x52, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85,
+      # 0x86, 0x87, 0x90, 0x91, 0x92, 0x93, 0xa0, 0xa1, 0xa2, 0xa3, 0xb0,
+      # 0xb1, 0xb2, 0xb3, 0xd0.
+      'filter',
+      # A byte (0..255) value, passed as the cto argument to unfilter.
+      'filter_cto',
+      # Compressed data as an str.
+      'compressed_data',
+      # Size of the uncompressed memory buffer. At least as much as the size
+      # of the uncompressed input data. Additional bytes will be filled with
+      # padding_char ('\0').
+      'ubufsize',
+      # Position-independent i386 machine code for the decompress function.
+      # Linux i386 ABI, see http://wiki.osdev.org/System_V_ABI
+      # C signature: int decompress(const char *inp, unsigned ins, char *outp, unsigned *ubufsizep) __attribute__((regparm(0)));
+      # Call decompress before unfilter.
+      # You need to know the uncompressed size first, put it to *ubufsizep.
+      # decompress will modify *ubufsizep, but eventually it will set it back to its
+      # initial value.
+      # M_NRV2B_LE32 (but not M_LZMA) ignores the initial value of *ubufsizep.
+      # Preallocate outp to that size.
+      # Pass compressed_data as inp[:ins].
+      # Returns 0 on success.
+      'decompress_code',
+      # Position-independent i386 machine code for the unfilter (lxunfilter) function.
+      # Linux i386 ABI, see http://wiki.osdev.org/System_V_ABI
+      # C signature: void unfilter(char *outp, unsigned ubufsize, unsigned filter_cto) __attribute__((regparm(0)));
+      # Call decompress before unfilter.
+      # No need to call unfilter if filter is 0.
+      # You need to know the uncompressed size first, put it to ubufsize.
+      # Preallocate outp to that size.
+      # Pass output of decompress as outp[:ubufsize].
+      'unfilter_code',
+  )
+
+  def __init__(self, **kwargs):
+    for name in self.__slots__:
+      setattr(self, name, None)
+    for name, value in sorted(kwargs.iteritems()):
+      setattr(self, name, value)
+
+  def __repr__(self):
+    return '%s(%s)' % (
+        type(self).__name__, ', '.join(
+            '%s=%r' % (name, getattr(self, name))
+            for name in sorted(self.__slots__)))
+
+
+def upx_make_uncompressed(udata):
+  """Returns UpxCompressed representing the original, uncompressed data."""
+  if not isinstance(udata, (str, buffer)):
+    raise TypeError
+  return UpxCompressed(
+      format=0,
+      filter=0,
+      filter_cto=0,
+      compressed_data=str(udata),
+      ubufsize=str(udata),
+      # Based on decompress_none.nasm
+      # !! Test it.
+      decompress_code='\x8bD$\x10\x8b\x009D$\x08t\x04\x83\xc8\xff\xc3VW\x8bt$\x0c\x8b|$\x14\x91\xf3\xa4_^1\xc0\xc3',
+      unfilter_code='\xc3',  # ret.
+  )
+
+
+def upx_compress32(udata, tmp_filename, method='--ultra-brute'):
+  """Compresses !! write docstring
+
+  Tested and works with UPX 3.94.
+
+  The corresponding decompression is not implemented.
+  !! Write a Linux i386 ELF file and run it. Alternatively, distribute a
+     decompressor source for Linux i386 which supports it all.
+
+  The compressed output may be longer than the input (udata), the caller has
+  to decide how to use or discard it.
+
+  Returns:
+    An UpxCompressed object describing the compressed output data.
+  """
+  if not isinstance(udata, (str, buffer)):
+    raise TypeError
   #method = '--best --small'  # !!  --small also avoids some nops.
   #method = '--best'
-  method = '--ultra-brute --small'  # !!
+  #method = '--ultra-brute --small'  # !!
   #method = '--lzma --small'   # This can force LZMA.
   #method = '-9'
   method = ['-' * (1 + (arg not in '123456789')) + arg for arg in
             (arg.strip('-') for arg in method.replace(',', ' ').split()) if arg]
+  if not method or method == ['--none']:
+    return upx_make_uncompressed(udata)
+
   # Example good: '--best'. Doesn't enable LZMA.
   # Example good: '--brute'. Also enables LZMA.
   # Example good: '--ultra-brute'. Also enables LZMA.
@@ -132,13 +232,6 @@ def bmcompress32(code, load_addr, tmp_filename, method='--ultra-brute', signatur
     # so we apply it.
     method.append('--small')
 
-  signature_ofs = 0
-  signature_ofs = 7  # !! Not.
-  signature = ''
-  after_signature_ofs = signature_ofs + len(signature)
-  if after_signature_ofs >= len(code):
-    return code  # Keep uncompressed.
-
   # Some golden values:
   #
   # * Input: 'X' * 0xfd1
@@ -149,18 +242,15 @@ def bmcompress32(code, load_addr, tmp_filename, method='--ultra-brute', signatur
   #   Compression: method=M_LZMA filter=0
   #
 
-  # !! Don't compress the entire thing, keep a few bytes in front of the signature intact. Header?
-  # !! Use signature_start_ofs_max.
-
   padding_char = '\0'
   # Avoid the UPX error: ': file is too small' by adding
   # padding (for Packer::checkDefaultCompressionRatio), which is OK with
   # at least 4096 bytes or 6.25% gain.
-  padding_size = 4096 - len(code) + after_signature_ofs - 0x54
+  padding_size = 4096 - len(udata) - 0x54
   if padding_size < 0:
     padding_size = 0
   elf32_size, elf32_header_adler32 = run_upx_elf32(
-      code[after_signature_ofs:], load_addr, tmp_filename, method, padding_char, padding_size)
+      udata, tmp_filename, method, padding_char, padding_size)
   if elf32_size is False:  # ': NotCompressibleException'.
     # Now we try to ensure a gain of >=4096 bytes, so UPX won't report
     # ': NotCompressibleException'. To do so, we add some trailing padding which is
@@ -169,13 +259,11 @@ def bmcompress32(code, load_addr, tmp_filename, method='--ultra-brute', signatur
     #
     # * With M_LZMA: decompressor + literal is <3404 bytes, 4096 + 3204 == 7600 bytes
     # * With others: decompressor + literal is  <704 bytes, 4096 +  704 == 4800 bytes
-    padding_size = (7600, 4800)[not has_lzma] + after_signature_ofs
+    padding_size = (7600, 4800)[not has_lzma]
     elf32_size, elf32_header_adler32 = run_upx_elf32(
-        code[after_signature_ofs:], load_addr, tmp_filename, method, padding_char, padding_size)
-  if not elf32_size:
-    return code  # Keep it unchanged.
-
-  # !! try different load_addr values
+        udata, tmp_filename, method, padding_char, padding_size)
+  if not elf32_size:  # ': NotCompressibleException' or ': file is too large'.
+    return upx_make_uncompressed(udata)
 
   # The upx binary calls upx_ucl_compress and upx_lzma_compress is called
   # with 3 different block sizes:
@@ -185,7 +273,7 @@ def bmcompress32(code, load_addr, tmp_filename, method='--ultra-brute', signatur
   #    buildLinuxLoader(
   #      stub_i386_linux_elf_entry, sizeof(stub_i386_linux_elf_entry),
   #      tmp,                       sizeof(stub_i386_linux_elf_fold),  ft );
-  # * len(code) + padding_size
+  # * len(udata) + padding_size
 
   data = open(tmp_filename, 'rb').read()
   i = 0
@@ -264,6 +352,8 @@ def bmcompress32(code, load_addr, tmp_filename, method='--ultra-brute', signatur
   phdr = None
   for phi in xrange(ehdr['e_phnum']):
     phdri = parse_struct(phdr_fields, data[i : i + 0x20])
+    # phi=0 p_vaddr=p_paddr=0xc01000
+    # phi=1 p_vaddr=p_paddr=0x1000 + load_addr
     dump_struct(phdr_fields, data[i : i + 0x20])
     i += 0x20
     if phdri['p_memsz'] != 0:
@@ -271,7 +361,6 @@ def bmcompress32(code, load_addr, tmp_filename, method='--ultra-brute', signatur
         raise ValueError('Too many phdrs.')
       phdr = phdri
   elf_hdr_size = i
-  print 'load_addr = 0x%x' % load_addr
 
   if phdr is None:
     raise ValueError('Missing phdr.')
@@ -285,14 +374,14 @@ def bmcompress32(code, load_addr, tmp_filename, method='--ultra-brute', signatur
     raise ValueError
   if phdr['p_offset'] != 0:
     raise ValueError
-  # !! Where is the base vaddr 0x00c01000 specified in the UPX sources? Can it change if we make the load_addr smaller?
+  # TODO(pts): Where is the base vaddr 0x00c01000 specified in the UPX sources?
+  #            Can it change if we make the load_addr smaller?
   
   # Based on PackLinuxElf64::unpack in p_lx_elf.cpp and p_unix.h .
-  # !! Check.
   l_info_fields = (  # 12-byte trailer in header for loader
-      ('l_checksum', 'L'),  # TODO(pts): Check this. (It doesn't seem to match.)
+      ('l_checksum', 'L'),  # TODO(pts): Check this adler32. (It doesn't seem to match.)
       ('l_magic', '4s'),  # UPX_MAGIC_LE32 == 'UPX!'.
-      ('l_lsize', 'H'),  # Decompressor stub size (?). 0x818 for ls.c32, 0x1200 for lua.c32.
+      ('l_lsize', 'H'),  # Decompressor size. 0x818 for ls.c32, 0x1200 for lua.c32.
       ('l_version', 'B'),  # Must be at least 10, getVersion() returns 13.
       ('l_format', 'B'),  # UPX_F_LINUX_ELF_i386 == 12.
   )
@@ -358,7 +447,7 @@ def bmcompress32(code, load_addr, tmp_filename, method='--ultra-brute', signatur
     #   LXMRU058?
     #   LXUNF035?
     #   LEXEC017? (if no filter)
-    #   --- This is the end of the decompression code.
+    #   --- This is the end of the decompression udata.
     #   IDENTSTR  '\n\0$Info: This file is packed with the UPX executable packer http://upx.sf.net $\n\0$Id: UPX ' ... '3.94 Copyright (C) 1996-2017 the UPX Team. All Rights Reserved. $\n\0'
     #   LEXEC020
     #   LUNMP000?
@@ -382,9 +471,9 @@ def bmcompress32(code, load_addr, tmp_filename, method='--ultra-brute', signatur
     i += b_info['sz_cpr']
   if data_b_info['sz_unc'] != elf32_size - 0x54:
     raise ValueError
-  if data_b_info['sz_unc'] != len(code) - after_signature_ofs + padding_size:
+  if data_b_info['sz_unc'] != len(udata) + padding_size:
     raise ValueError
-  if data_b_info['sz_cpr'] >= data_b_info['sz_unc']:
+  if data_b_info['sz_cpr'] >= len(udata) + padding_size:
     raise ValueError('Compression not effective, UPX should have failed already.')
   compressed_data = buffer(data, data_b_info['c_ofs'], data_b_info['sz_cpr'])
 
@@ -473,11 +562,11 @@ def bmcompress32(code, load_addr, tmp_filename, method='--ultra-brute', signatur
     raise ValueError
   #if ph['ph_level'] != ...:  # Not stored anywhere else.
   #  raise ValueError
-  if ph['ph_u_adler'] != (zlib.adler32(padding_char * padding_size, zlib.adler32(code[after_signature_ofs:], elf32_header_adler32)) & 0xffffffff):
+  if ph['ph_u_adler'] != (zlib.adler32(padding_char * padding_size, zlib.adler32(udata, elf32_header_adler32)) & 0xffffffff):
     raise ValueError
   if ph['ph_c_adler'] != (c_adler32 & 0xffffffff):
     raise ValueError
-  if ph['ph_u_len'] != data_b_info['sz_unc']:
+  if ph['ph_u_len'] != len(udata) + padding_size:
     raise ValueError
   if ph['ph_c_len'] != len(compressed_data):
     raise ValueError
@@ -502,26 +591,53 @@ def bmcompress32(code, load_addr, tmp_filename, method='--ultra-brute', signatur
   # compressed FOLDEXEC (stub_i386_linux_elf_fold), which is <1630 bytes
   # (less because of compression).
   loader_end_ofs = i
-
-  if data_b_info['sz_cpr'] + (loader_end_ofs - loader_ofs) >= data_b_info['sz_unc']:
+  if data_b_info['sz_cpr'] + (loader_end_ofs - loader_ofs) >= len(udata) + padding_size:
     raise ValueError('Compression not effective, UPX should have failed already.')
+  if data_b_info['b_ftid'] != 0:
+    decompress_ofs = loader_ofs + 7 + ord(data[loader_ofs + 6])
+    decompress_code = data[decompress_ofs : loader_end_ofs]
+    unfilter_code = data[loader_ofs + 7 : decompress_ofs]
+    filter_cto = data_b_info['b_cto8']
+  else:
+    decompress_code = data[loader_ofs + 5 : loader_end_ofs]
+    unfilter_code = '\xc3'  # ret.
+    filter_cto = 0
+  os.unlink(tmp_filename)  # Keep it if there is an exception.
+  return UpxCompressed(
+      format=l_info['l_format'],
+      filter=data_b_info['b_ftid'],
+      filter_cto=filter_cto,
+      compressed_data=str(compressed_data),
+      ubufsize=len(udata) + padding_size,
+      decompress_code=decompress_code,
+      unfilter_code=unfilter_code,
+  )
 
-  # Fortunately the UPX decompressor code (decompress and lxunfilter) is position-independent.
+
+
+def bmcompress32_asm(udata, tmp_filename, method='--ultra-brute', prefix_size=0):
+  """Compresses !! write docstring"""
+  if not isinstance(udata, (str, buffer)):
+    raise TypeError
+  if len(udata) < prefix_size:
+    raise ValueError('Uncompressed data too short.')
+  ch = upx_compress32(buffer(udata, prefix_size), tmp_filename, method)
 
   def to_byte(s):
     return '.byte %s\n' % ','.join(str(ord(c)) for c in s)
 
   output = [
-      '/* decompress_size = %d */\n' % (loader_end_ofs - loader_ofs - 7),
+      '/* decompressor_size = %d */\n' % (len(ch.unfilter_code * (ch.filter != 0)) + len(ch.decompress_code)),
       '.text\n',
-      '.globl before_signature_data\n',
-      'before_signature_data:\n',
-      to_byte(code[:after_signature_ofs]),  # !! Include the code below in the signature?
-      '.global smart_decompress\n',
+      '.globl prefix_data\n',
+      'prefix_data:\n',
+      to_byte(buffer(udata, 0, prefix_size)),
+      '.globl prefix_data_end\n',
+      'prefix_data_end:\n',
+      '.globl smart_decompress\n',
       'smart_decompress:\n',
   ]
-  if data_b_info['b_ftid'] != 0:
-    decompress_ofs = loader_ofs + 7 + ord(data[loader_ofs + 6])
+  if ch.filter != 0:
     output.extend((
         # 00000000  E800000000        call dword 0x5
         '.byte 0xe8; .long 0\n'
@@ -531,15 +647,15 @@ def bmcompress32(code, load_addr, tmp_filename, method='--ultra-brute', signatur
         # 00000006  58                pop eax
         '.byte 0x58\n'
         # 00000007  6A0B              push byte +0xb
-        '.byte 0x6a, %d\n' % data_b_info['b_cto8'],
+        '.byte 0x6a, %d\n' % ch.filter_cto,
         # 00000009  053E000000        add eax,0x3e  # sz_unc - .after_call_next
-        '.byte 0x05; .long %d\n' % (loader_end_ofs - loader_ofs - 7 + 0x38 - 0x5),
+        '.byte 0x05; .long %d\n' % (len(ch.unfilter_code) + len(ch.decompress_code) + 0x38 - 0x5),
         # 0000000E  50                push eax
         '.byte 0x50\n'
         # 0000000F  52                push edx
         '.byte 0x52\n'
         # 00000010  680A000000        push dword 0xa
-        '.byte 0x68; .long %d\n' % len(compressed_data),
+        '.byte 0x68; .long %d\n' % len(ch.compressed_data),
         # 00000015  83C008            add eax,byte +0x8
         '.byte 0x83, 0xc0, 0x08\n'
         # 00000018  50                push eax
@@ -547,8 +663,8 @@ def bmcompress32(code, load_addr, tmp_filename, method='--ultra-brute', signatur
         # 00000019  E81B000000        call dword 0x39  # decompress
         # decompress modifies its outs arg (and then it changes it back),
         # so we need to compile it with `gcc -Wl,-N' for a writable .text
-        # section.
-        '.byte 0xe8; .long %d\n' % (decompress_ofs - loader_ofs - 7 + 0x38 - 0x1e),
+        # section. Without that it will fail with `Segmentation fault'.
+        '.byte 0xe8; .long %d\n' % (len(ch.unfilter_code) + 0x38 - 0x1e),
         # 0000001E  85C0              test eax,eax
         '.byte 0x85, 0xc0\n'
         # 00000020  7402              jz 0x24
@@ -579,18 +695,14 @@ def bmcompress32(code, load_addr, tmp_filename, method='--ultra-brute', signatur
         '.byte 0x58\n'
         # 00000033  C3                ret
         '.byte 0xc3\n'
-        # 00000034  ????????
+        # 00000034  5550587E          db 'UPX~'
         '.byte \'U\', \'P\', \'X\', \'~\'\n'
         # 00000038  (EOF)
-        '.global lxunfilter\n',
+        '.globl lxunfilter\n',
         'lxunfilter:  /* must come directly after the end of smart_decompress */\n',
-        to_byte(data[loader_ofs + 7 : decompress_ofs]),  # !! Is .lstrip('\x90') safe here? .rstrip('\0') isn't safe, because it ruins the relative offsets.
-        '.globl decompress\n',
-        'decompress:\n',
-        to_byte(data[decompress_ofs : loader_end_ofs]),
+        to_byte(ch.unfilter_code),  # !! Is .lstrip('\x90') safe here? .rstrip('\0') isn't safe, because it ruins the relative offsets.
     ))
   else:
-    decompress_ofs = loader_ofs + 5
     output.extend((
         # 00000000  E800000000        call dword 0x5
         '.byte 0xe8; .long 0\n'
@@ -599,19 +711,19 @@ def bmcompress32(code, load_addr, tmp_filename, method='--ultra-brute', signatur
         # 00000006  58                pop eax
         '.byte 0x58\n'
         # 00000007  0530000000        add eax,0x30
-        '.byte 0x05; .long %d\n' % (loader_end_ofs - loader_ofs - 5 + 0x2b - 0x5),
+        '.byte 0x05; .long %d\n' % (len(ch.decompress_code) + 0x2b - 0x5),
         # 0000000C  50                push eax
         '.byte 0x50\n'
         # 0000000D  52                push edx
         '.byte 0x52\n'
         # 0000000E  680A000000        push dword 0xa
-        '.byte 0x68; .long %d\n' % len(compressed_data),
+        '.byte 0x68; .long %d\n' % len(ch.compressed_data),
         # 00000013  83C008            add eax,byte +0x8
         '.byte 0x83, 0xc0, 0x08\n'
         # 00000016  50                push eax
         '.byte 0x50\n'
         # 00000017  E80F000000        call dword 0x2b  # decompress
-        '.byte 0xe8; .long %d\n' % (decompress_ofs - loader_ofs - 5 + 0x2b - 0x1c),
+        '.byte 0xe8; .long %d\n' % (0x2b - 0x1c),
         # 0000001C  85C0              test eax,eax
         '.byte 0x85, 0xc0\n'
         # 0000001E  7402              jz 0x22
@@ -630,36 +742,40 @@ def bmcompress32(code, load_addr, tmp_filename, method='--ultra-brute', signatur
         '.byte 0x58\n'
         # 00000026  C3                ret
         '.byte 0xc3\n'
-        # 00000027  55505823          db 'UPX#'
-        '.byte \'U\', \'P\', \'X\', \'#\'\n'
+        # 00000027  5550587E          db 'UPX~'
+        '.byte \'U\', \'P\', \'X\', \'~\'\n'
         # 0000002B  (EOF)
-        '.globl decompress\n',
-        'decompress:\n',
-        to_byte(data[decompress_ofs : loader_end_ofs]),
     ))
 
+  # !! Handle if compressed data is not smaller than the original (in .c32).
+
   output.extend((
-      '.globl sz_unc\n',
-      'sz_unc:  /* must be directly in front of uncompressed_data_size */\n',
-      '.long %d\n' % data_b_info['sz_unc'],
+      '.globl decompress\n'
+      'decompress:\n',
+      to_byte(ch.decompress_code),
+      '.globl ubufsize\n'
+      # Can be larger than len(udata) by padding_size.
+      'ubufsize:  /* must be directly in front of uncompressed_data_size */\n',
+      '.long %d\n' % ch.ubufsize,
       '.globl uncompressed_data_size\n',
-      'uncompressed_data_size:  /* must be directly in front of compressed_data */\n',
-      '.long %d\n' % len(code),  # Without padding.  !! Make it work with no prefix.
+      'uncompressed_data_size:  /* must be directly in front of compressed_data */\n'
+      '.long %d\n' % (len(udata) - prefix_size),
       '.globl compressed_data\n',
       'compressed_data:\n',
-      to_byte(compressed_data),
+      to_byte(ch.compressed_data),
   ))
   open('deco.s', 'w').write(''.join(output))
   open('deco.h', 'w').write(''.join((
-      '#define AFTER_SIGNATURE_OFS %dU\n' % after_signature_ofs,
-      'void lxunfilter(char *p, unsigned s, unsigned cto8 /*, unsigned ftid */ ) __attribute__((regparm(0)));;\n'
-      'int decompress(const char *inp, unsigned ins, char *outp, unsigned *outs  /* , unsigned params */) __attribute__((regparm(0)));;\n'
+      'void lxunfilter(char *p, unsigned s, unsigned cto8 /*, unsigned ftid */ ) __attribute__((regparm(0)));\n'
+      'int decompress(const char *inp, unsigned ins, char *outp, unsigned *outs  /* , unsigned params */) __attribute__((regparm(0)));\n'
       'void smart_decompress(char *outp) __attribute__((regparm(3)));\n'
-      'extern unsigned sz_unc;\n'
+      'extern unsigned ubufsize;\n'
       'extern const unsigned uncompressed_data_size;\n'
-      'extern const char before_signature_data[];\n'
+      'extern const char prefix_data[];\n'
+      'extern const char prefix_data_end[];\n'
       'extern const char compressed_data[];\n')))
 
+  # !! Get new stats, with details on len(decompress_code) etc.
   # method=M_LZMA filter=0 decompress_size=2835
   # --small method=M_LZMA filter=0 decompress_size=2858
   # method=M_LZMA filter=0x49 decompress_size=2923
@@ -671,11 +787,12 @@ def bmcompress32(code, load_addr, tmp_filename, method='--ultra-brute', signatur
 
 
 def main(argv):
+  prefix_size = 7
   for filename in argv[1:]:
     print >>sys.stderr, 'info: compressing: %s' % filename
     code = open(filename, 'rb').read()
     tmp_filename = filename + '.tmp'
-    code = bmcompress32(code, None, tmp_filename)
+    code = bmcompress32_asm(code, tmp_filename, prefix_size=prefix_size)
   #open(tmp_filename, 'wb').write(code)
 
 
