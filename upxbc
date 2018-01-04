@@ -256,6 +256,32 @@ def adler32_combine(adler1, adler2, len2):
 #assert adler32_combine(zlib.adler32(s1), zlib.adler32(s2), len(s2)) == (zlib.adler32(s1 + s2) & 0xffffffff)
 
 
+def pack_fields(fields):
+  output = []
+  for name, format, value in fields:
+    #print (name, format, value)
+    if format == '.str':
+      output.append(str(value))
+    elif format == '.pad':
+      output.append('\0' * (-sum(len(x) for x in output) % value))
+    elif format == '.phcs':  # PackHeader checksum byte of the `value' preceding bytes.
+      buf = ''
+      i = len(output)
+      while len(buf) < value and i > 0:
+        i -= 1
+        buf = output[i] + buf
+      assert len(buf) == value
+      output.append(chr(sum(ord(c) for c in buf) % 251))
+    elif format == '.minsize':
+      size = sum(len(x) for x in output)
+      if size < value:
+        output.append('\0' * (value - size))
+    else:
+      output.append(struct.pack('<' * (format[0][0] not in '<>') + format, value))
+  #assert 0, [sum(len(x) for x in output), bend_ofs]
+  return ''.join(output)
+
+
 def build_elf32_for_upx_decompression(
     ch, compressed_elf32_header, udata_size, udata_adler32):
   """Builds a Linux i386 ELF executable which UPX can decompress."""
@@ -356,30 +382,7 @@ def build_elf32_for_upx_decompression(
       ('overlay_ofs', 'L', 0x80),
       ('minsize_pad', '.minsize', 0x200),
   )
-
-  output = []
-  for name, format, value in fields:
-    #print (name, format, value)
-    if format == '.str':
-      output.append(str(value))
-    elif format == '.pad':
-      output.append('\0' * (-sum(len(x) for x in output) % value))
-    elif format == '.phcs':  # PackHeader checksum byte of the `value' preceding bytes.
-      buf = ''
-      i = len(output)
-      while len(buf) < value and i > 0:
-        i -= 1
-        buf = output[i] + buf
-      assert len(buf) == value
-      output.append(chr(sum(ord(c) for c in buf) % 251))
-    elif format == '.minsize':
-      size = sum(len(x) for x in output)
-      if size < value:
-        output.append('\0' * (value - size))
-    else:
-      output.append(struct.pack('<' * (format[0][0] not in '<>') + format, value))
-  #assert 0, [sum(len(x) for x in output), bend_ofs]
-  return ''.join(output)
+  return pack_fields(fields)
 
 
 def get_upx_method_args(method):
@@ -408,6 +411,42 @@ def get_upx_method_args(method):
   if not method:
     method.append('--ultra-brute')
   return method
+
+
+EHDR_FIELDS = (
+    ('ei_mag', '4s'),
+    ('ei_class', 'B'),
+    ('ei_data', 'B'),
+    ('ei_version', 'B'),
+    ('e_osabi', 'B'),
+    ('e_abiversion', 'B'),
+    ('e_pad', '7s'),
+    ('e_type', 'H'),
+    ('e_machine', 'H'),
+    ('e_version', 'L'),
+    ('e_entry', 'L'),
+    ('e_phoff', 'L'),
+    ('e_shoff', 'L'),
+    ('e_flags', 'L'),
+    ('e_ehsize', 'H'),
+    ('e_phentsize', 'H'),
+    ('e_phnum', 'H'),
+    ('e_shentsize', 'H'),
+    ('e_shnum', 'H'),
+    ('e_shstrndx', 'H'),
+)
+
+
+PHDR_FIELDS = (  # ELF program header.
+    ('p_type', 'L'),
+    ('p_offset', 'L'),
+    ('p_vaddr', 'L'),
+    ('p_paddr', 'L'),
+    ('p_filesz', 'L'),
+    ('p_memsz', 'L'),
+    ('p_flags', 'L'),
+    ('p_align', 'L'),
+)
 
 
 def upx_compress32(udata, tmp_filename, method=None, need_decompress_code=False):
@@ -509,30 +548,8 @@ def upx_compress32(udata, tmp_filename, method=None, need_decompress_code=False)
       raise ValueError('LZMA not expected.')
 
   i = 0
-  ehdr_fields = (
-      ('ei_mag', '4s'),
-      ('ei_class', 'B'),
-      ('ei_data', 'B'),
-      ('ei_version', 'B'),
-      ('e_osabi', 'B'),
-      ('e_abiversion', 'B'),
-      ('e_pad', '7s'),
-      ('e_type', 'H'),
-      ('e_machine', 'H'),
-      ('e_version', 'L'),
-      ('e_entry', 'L'),
-      ('e_phoff', 'L'),
-      ('e_shoff', 'L'),
-      ('e_flags', 'L'),
-      ('e_ehsize', 'H'),
-      ('e_phentsize', 'H'),
-      ('e_phnum', 'H'),
-      ('e_shentsize', 'H'),
-      ('e_shnum', 'H'),
-      ('e_shstrndx', 'H'),
-  )
-  ehdr = parse_struct(ehdr_fields, data[i : i + 0x34])
-  dump_struct(ehdr_fields, data[i : i + 0x34])  # !! Make these calls optional.
+  ehdr = parse_struct(EHDR_FIELDS, data[i : i + 0x34])
+  dump_struct(EHDR_FIELDS, data[i : i + 0x34])  # !! Make these calls optional.
   i += 0x34
 
   if ehdr['ei_mag'] != '\x7fELF':
@@ -571,22 +588,12 @@ def upx_compress32(udata, tmp_filename, method=None, need_decompress_code=False)
   if ehdr['e_phoff'] != i:
     raise ValueError
 
-  phdr_fields = (  # ELF program header.
-      ('p_type', 'L'),
-      ('p_offset', 'L'),
-      ('p_vaddr', 'L'),
-      ('p_paddr', 'L'),
-      ('p_filesz', 'L'),
-      ('p_memsz', 'L'),
-      ('p_flags', 'L'),
-      ('p_align', 'L'),
-  )
   phdr = None
   for phi in xrange(ehdr['e_phnum']):
-    phdri = parse_struct(phdr_fields, data[i : i + 0x20])
+    phdri = parse_struct(PHDR_FIELDS, data[i : i + 0x20])
     # phi=0 p_vaddr=p_paddr=0xc01000
     # phi=1 p_vaddr=p_paddr=0x1000 + load_addr
-    dump_struct(phdr_fields, data[i : i + 0x20])
+    dump_struct(PHDR_FIELDS, data[i : i + 0x20])
     i += 0x20
     if phdri['p_memsz'] != 0:
       if phdr is not None:
@@ -988,6 +995,9 @@ def get_smart_decompress_code(ch, udata=None):
 
   Args:
     ch: A UpxCompressed object.
+    udata: The uncompressed input data (code), or None. If not None, then
+        an uncompressed smart_decompress function is also generated, and
+        the smaller of the compressed and the uncompressed is returned.
   Returns:
     tuple of ch (possibly new) and
     str containing position-independent Linux i386 machine code for the
@@ -1079,6 +1089,199 @@ def compress_c32(udata, tmp_filename, method=None):
   return compress_flat32(udata, tmp_filename, method, prefix_size=5)
 
 
+def get_elftiny32_size(text_data_size, load_addr):
+  return 0x54 + ((load_addr - 0x54) & 0xfff) + text_data_size
+
+
+def build_elftiny32(text_data, load_addr, entry_addr, end_addr, e_osabi=3):
+  if not isinstance(text_data, (str, buffer)):
+    raise TypeError
+  if load_addr <= 0:
+    raise ValueError
+  if end_addr - load_addr < len(text_data):
+    raise ValueError
+  if not (load_addr <= entry_addr < end_addr):
+    raise ValueError
+  # Make room for the ELF32 header at the beginning of the first page.
+  prefix = '\0' * ((load_addr - 0x54) & 0xfff)
+  vaddr = load_addr - len(prefix) - 0x54
+  assert (vaddr & 0xfff) == 0  # Aligned to page boundary.
+  fields = (
+      ('ei_mag', '4s', '\x7fELF'),
+      ('ei_class', 'B', 1),
+      ('ei_data', 'B', 1),
+      ('ei_version', 'B', 1),
+      ('e_osabi', 'B', e_osabi),
+      ('e_abiversion', 'B', 0),
+      ('e_pad', '7s', '\0\0\0\0\0\0\0'),
+      ('e_type', 'H', 2),
+      ('e_machine', 'H', 3),
+      ('e_version', 'L', 1),
+      ('e_entry', 'L', entry_addr),
+      ('e_phoff', 'L', 0x34),
+      ('e_shoff', 'L', 0),
+      ('e_flags', 'L', 0),
+      ('e_ehsize', 'H', 0x34),
+      ('e_phentsize', 'H', 0x20),
+      ('e_phnum', 'H', 1),
+      ('e_shentsize', 'H', 0),  # pts-xtiny has 0; 0x28 also works.
+      ('e_shnum', 'H', 0),
+      ('e_shstrndx', 'H', 0),
+      ('p_type', 'L', 1),
+      ('p_offset', 'L', 0),
+      ('p_vaddr', 'L', vaddr),
+      ('p_paddr', 'L', vaddr),
+      ('p_filesz', 'L', load_addr + len(text_data) - vaddr),
+      ('p_memsz', 'L', end_addr - vaddr),
+      ('p_flags', 'L', 7),
+      ('p_align', 'L', 0x1000),  # pts-xtiny has 0x1000; 1 also works.
+      ('prefix', '.str', prefix),
+      ('text_data', '.str', text_data),
+  )
+  result = pack_fields(fields)
+  assert len(result) == get_elftiny32_size(len(text_data), load_addr)
+  return result
+
+
+def compress_elftiny32(udata, tmp_filename, method=None):
+  """Compresses a statically linked Linux i386 executable.
+
+  It is similar to using UPX directly on the input file, but the output file
+  is about 1502 bytes smaller, because it implements a simpler FOLDEXEC
+  logic, without calling mmap(2).
+
+  Currently it accepts statically linked executables created by
+  https://github.com/pts/pts-xtiny or similar ones, the output of vanilla
+  `gcc -m32 -static' with glibc doesn't work.
+
+  Please note that dynamically linked executables (i.e. `gcc' without
+  `-static') are not supported.
+
+  Caveats:
+
+  * Some extra memory containing the compressed executable is memory-mapped
+    in front of the regular pages, and it will remain mapped while the
+    program runs, using extra memory, and not producing any segmentation
+    faults there.
+  * Also some extra 0 bytes may remain memory-mapped after the regular
+    pages.
+  * The in-memory copy of the original ELF header is not available, it is
+    overwritten with garbage.
+
+    TODO(pts): Add a command-line flag to fix this.
+
+  TODO(pts): Make it work with glibc (but no PT_INTERP).
+  """
+  if not isinstance(udata, (str, buffer)):
+    raise TypeError
+
+  udata = buffer(udata)
+  i = 0
+  ehdr = parse_struct(EHDR_FIELDS, udata[i : i + 0x34])
+  dump_struct(EHDR_FIELDS, udata[i : i + 0x34])
+  i += 0x34
+
+  # This accepts a Linux i386 ELF executable created by pts-xtiny.
+
+  if ehdr['ei_mag'] != '\x7fELF':
+    raise ValueError
+  if ehdr['ei_class'] != 1:
+    raise ValueError
+  if ehdr['ei_data'] != 1:
+    raise ValueError
+  if ehdr['ei_version'] != 1:
+    raise ValueError
+  if ehdr['e_osabi'] not in (0, 3):  # 0: System V, 3: Linux.
+    raise ValueError
+  if ehdr['e_abiversion'] != 0:
+    raise ValueError
+  #if ehdr['e_pad'] != '\0\0\0\0\0\0\0':
+  #  raise ValueError
+  if ehdr['e_type'] != 2:
+    raise ValueError('Expected an executable file.')
+  if ehdr['e_machine'] != 3:  # x86.
+    raise ValueError('Expected i386.')
+  if ehdr['e_version'] != 1:
+    raise ValueError
+  if ehdr['e_ehsize'] != 0x34:
+    raise ValueError
+  if ehdr['e_phentsize'] != 0x20:
+    raise ValueError
+  if ehdr['e_flags'] != 0:
+    raise ValueError
+  if ehdr['e_shentsize'] not in (0, 0x28):
+    raise ValueError
+  if ehdr['e_phnum'] != 1:
+    raise ValueError(
+        'Bad number of program header entries: %d' % ehdr['e_phnum'])
+  if ehdr['e_phoff'] != i:
+    raise ValueError
+  e_osabi = ehdr['e_osabi']
+
+  phdr = parse_struct(PHDR_FIELDS, udata[i : i + 0x20])
+  # phi=0 p_vaddr=p_paddr=0xc01000
+  # phi=1 p_vaddr=p_paddr=0x1000 + load_addr
+  dump_struct(PHDR_FIELDS, udata[i : i + 0x20])
+  i += 0x20
+  if phdr['p_type'] != 1:  # PT_LOAD.
+    raise ValueError
+  if phdr['p_offset'] != 0:
+    raise ValueError
+  if (phdr['p_flags'] & ~7) != 0:  # Standardize to 7.
+    raise ValueError
+  if phdr['p_vaddr'] != phdr['p_paddr']:
+    raise ValueError
+  if phdr['p_filesz'] > len(udata):
+    raise ValueError
+  if phdr['p_filesz'] < 0x54:
+    raise ValueError
+  if phdr['p_memsz'] < phdr['p_filesz']:
+    raise ValueError
+  if not (i <= ehdr['e_entry'] - phdr['p_vaddr'] < phdr['p_filesz']):
+    raise ValueError
+
+  j = phdr['p_filesz']
+  orig_load_addr = phdr['p_vaddr'] + i
+  while i < j and udata[i] == '\0':  # Remove leading 0s.
+    i += 1
+  while i < j and udata[j - 1] == '\0':  # Remove trailing 0s.
+    j -= 1
+  text_data = buffer(udata, i, j - i)
+  # Memory address to which text_data is loaded.
+  load_addr = phdr['p_vaddr'] + i
+  entry_addr = ehdr['e_entry']
+  end_addr = phdr['p_vaddr'] + phdr['p_memsz']
+  assert end_addr - load_addr >= len(text_data)  # Follows from above.
+  # This would create an identical output file for pts-xtiny.
+  #data = build_elftiny32(
+  #    text_data, load_addr, entry_addr, end_addr, e_osabi)
+  #open('te.bin', 'wb').write(data)
+
+  ch = upx_compress32(
+      text_data, tmp_filename, method, need_decompress_code=True)
+  ch, smart_decompress_code = get_smart_decompress_code(ch, udata=text_data)
+  if ch.method != 0:
+    # Based on elftiny_smart_decompress.asm .
+    # mov eax, ...; push ...; (fall through to smart_decompress)
+    prefix_code = struct.pack('<BLBL', 0xb8, load_addr, 0x68, entry_addr)
+    decompress_code_size = len(prefix_code) + len(smart_decompress_code)
+    if orig_load_addr - decompress_code_size < 0x11054:
+      # The 0x11000 is a padding which sounds safe.
+      raise ValueError('e_entry too small in elftiny32 input.')
+    # Align the ELF32 header (0x54 bytes) to 0x1000 boundary.
+    compressed_load_addr = ((orig_load_addr - decompress_code_size - 0x54) &
+                            ~0xfff) + 0x54
+    if (get_elftiny32_size(decompress_code_size, compressed_load_addr) <
+        get_elftiny32_size(len(text_data), load_addr)):
+      # Replace uncompressed code with compressed code.
+      (text_data, load_addr, entry_addr, end_addr) = (
+          prefix_code + smart_decompress_code,
+          compressed_load_addr, compressed_load_addr,
+          max(end_addr, load_addr + ch.ubufsize))
+  return build_elftiny32(
+      text_data, load_addr, entry_addr, end_addr, e_osabi)
+
+
 def compress_with_upx(udata, tmp_filename, method=None, do_decompress=False):
   open(tmp_filename, 'wb').write(udata)
   os.chmod(tmp_filename, 0700)  # UPX needs an executable.
@@ -1159,7 +1362,7 @@ def example():
   data = compress_c32(open('../../tinyc32/examples/hello_long.c32', 'rb').read(), 't.tmp')
   open('a.c32', 'wb').write(data)
 
-  prefix_size = 7  # !!
+  prefix_size = 7
   #prefix_size = 0
   #method = '--lzma'
   method = None
@@ -1190,8 +1393,9 @@ def detect_input_format(udata, input_format):
 
   if input_format is None:
     return detected_format
-  if input_format != detected_format and input_format not in (
-      'binary', 'flat32'):
+  if input_format != detected_format and not (
+      input_format in ('binary', 'flat32') or
+      (input_format == 'elftiny32' and detected_format == 'elf')):
     raise ValueError('Input format mismatch: detected %s, asked %s' %
                      (detected_format, input_format))
   return input_format
@@ -1206,6 +1410,7 @@ def main(argv):
   output_format = None
   prefix_size = None
   do_check_decompress = False
+  do_set_executable_bit = True
 
   if len(argv) < 2 or argv[1] == '--help':
     sys.stderr.write('Usage: %s [<flag>...] <input-file> <output-file>\n' % argv[0])
@@ -1238,6 +1443,8 @@ def main(argv):
       input_format = 'c32'  # Superfluous, can be autodetected.
     elif arg == '--upxz':
       output_format = 'upxz'
+    elif arg in ('--elftiny', '--elftiny32'):
+      input_format = 'elftiny32'
     elif arg.startswith('--prefix='):
       prefix_size = int(arg.split('=', 1)[1], 0)
     elif arg.startswith('--in='):
@@ -1296,7 +1503,14 @@ def main(argv):
     data = compress_flat32_to_asm(
         udata, tmp_filename, method=method, prefix_size=(prefix_size or 0))
   elif input_format == output_format == 'c32':
+    # TODO(pts): Add decompressor by analyzing assembly code in
+    # smart_decompress_code: figuring out method (2, 5, 8 or 14), filter (0,
+    # 0x46 or 0x49), filter_cto. Still we may get a little bit different file
+    # for elftiny32.
     data = compress_c32(udata, tmp_filename, method=method)
+  elif input_format == output_format == 'elftiny32':
+    data = compress_elftiny32(udata, tmp_filename, method=method)
+    do_set_executable_bit = True
   elif (input_format == 'binary' and output_format == 'upxz' and
         not do_decompress):
     data = compress_upxz(udata, tmp_filename, method=method,
@@ -1307,6 +1521,7 @@ def main(argv):
   elif input_format == output_format and input_format in ('elf', 'exe'):
     data = compress_with_upx(
         udata, tmp_filename, method=method, do_decompress=do_decompress)
+    do_set_executable_bit = True
   elif input_format == output_format == 'unknown':
     sys.exit(
         'fatal: failed to detect input format, specify any of: '
@@ -1323,6 +1538,9 @@ def main(argv):
     print >>sys.stderr, 'info: writing compressed output: %s (%d bytes, format %s)' % (
         output_file, len(data), output_format)
   open(output_file, 'wb').write(data)
+  if do_set_executable_bit:
+    old_mode = os.stat(input_file).st_mode
+    os.chmod(output_file, 0100 | (old_mode & 0777))
 
 
 if __name__ == '__main__':
