@@ -16,8 +16,11 @@ Features:
   have a specific header.
 * Compressing arbitrary i386 flat executables to GNU assembler .s source
   files, to be included in other programs.
-* Works better for small files (as small as 512 bytes), where UPX refuses to
-  do anything.
+* (--elftiny) Compressing statically linked Linux i386 executables with
+  about 1500 bytes smaller output file size than UPX. This is accomplished
+  by generating a smaller stub, at the cost of some security.
+* It works better for small files (as small as 512 bytes), where UPX refuses
+  to do anything.
 
 Requirements and compatibility:
 
