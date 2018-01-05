@@ -385,31 +385,92 @@ def build_elf32_for_upx_decompression(
   return pack_fields(fields)
 
 
-def get_upx_method_args(method):
-  if not method:
-    method = '--ultra-brute'
-    #method = '--best --nrv2b'  # Doesn't select with --brute or --ultrabrute.
-    #method = '--best --nrv2d'  # Doesn't select with --brute or --ultrabrute.
-    #method = '--best --nrv2e'  # Doesn't select with --brute or --ultrabrute.
-    #method = '--best --small'  # !!  --small also avoids some nops.
-    #method = '--best'
-    #method = '--ultra-brute --small'  # !!
-    #method = '--lzma --small'   # This can force LZMA.
-    #method = '-9'
-    #method = '--ultra-brute --small --no-filter'  # !!
-    #method = '--none'
+UPX_NONLZMA_EFFORT_METHOD_FLAGS = (
+    '--best', '-1', '-2', '-3', '-4', '-5', '-6', '-7', '-8', '-9')
+
+UPX_EFFORT_METHOD_FLAGS = UPX_NONLZMA_EFFORT_METHOD_FLAGS + (
+    '--brute', '--ultra-brute')
+
+UPX_NRV_METHOD_FLAGS = ('--nrv2b', '--nrv2d', '--nrv2e')
+
+
+def get_upx_method_flags(method):
   if isinstance(method, str):
     method = method.replace(',', ' ').split()
-  method = ['-' * (1 + (arg not in '123456789')) + arg for arg in
-            (arg.strip('-') for arg in method) if arg]
+  method = ['-' * (1 + (flag not in '123456789')) + flag for flag in
+            (flag.strip('-') for flag in method) if flag]
+  #method = '--best --nrv2b'  # Doesn't select with --brute or --ultra-brute. !!
+  #method = '--best --nrv2d'  # Doesn't select with --brute or --ultra-brute.
+  #method = '--best --nrv2e'  # Doesn't select with --brute or --ultra-brute.
+  #method = '--best --small'  # !!  --small also avoids some nops.
+  #method = '--best'
+  #method = '--ultra-brute --small'  # !!
+  #method = '--lzma --small'   # This can force LZMA.
+  #method = '-9'
+  #method = '--ultra-brute --small --no-filter'  # !!
+  #method = '--none'
   # Example good: '--best'. Doesn't enable LZMA.
   # Example good: '--brute'. Also enables LZMA.
   # Example good: '--ultra-brute'. Also enables LZMA.
   # Example good: '--ultra-brute --lzma'.
-  if method == ['--no-lzma']:
-    method[:] = ('--best', '--no-lzma')
-  if not method:
-    method.append('--ultra-brute')
+
+  has_effort = len([1 for flag in method if flag in UPX_EFFORT_METHOD_FLAGS])
+  has_nonlzma_effort = len(
+      [1 for flag in method if flag in UPX_NONLZMA_EFFORT_METHOD_FLAGS])
+  has_nrv = len(
+      [1 for flag in method if flag in UPX_NRV_METHOD_FLAGS])
+  if '--none' in method:
+    method[:] = [flag for flag in method if flag not in (
+        '--none', '--no-filter', '--small')]
+    if method:
+      raise ValueError('--none must be specified alone.')
+    return ['--none']
+  #if not has_effort:
+  #  #method[:0] = ('--ultra-brute',)  # Can negate --lzma.
+  #  method[:0] = ('--best',)
+  # just --brute enables LZMA and non-LZMA
+  # just --ultra-brute enables LZMA and non-LZMA
+  # --ultra-brute --no-lzma  prevents --lzma
+  # !! --best doesn't enable --lzma by default
+  # !! `--best --lzma' and `--lzma --best' force LZMA,
+  if '--no-lzma' in method:
+    if '--lzma' in method:
+      raise ValueError('Both --lzma and --no-lzma was specified.')
+    if not has_effort:
+      # `--ultra-brute --no-lzma' doesn't produce LZMA output.
+      method[:0] = ('--ultra-brute',)
+  elif '--lzma' in method:
+    if has_nonlzma_effort:
+      # `--best --lzma' is equivalent to `--lzma', and it forces LZMA.
+      # To avoid confusion, only --lzma should be specified.
+      raise ValueError(
+          'If you want LZMA-only output, specify --lzma without --best or -<n>'
+          '; you get LZMA-or-others by default.')
+    if not has_effort:
+      # `--ultra-brute --lzma' and `--brute --lzma' may still produce
+      # non-LZMA output, but `--best --lzma' forces LZMA output.
+      # So does `--lzma', so we don't add `--best' here.
+      pass
+  else:
+    if not has_effort:
+      if has_nrv:
+        # --brute or --ultra-brute would shadow --nrv... , and it may make
+        # --UPX choose the wrong NRV algorithm.
+        method[:0] = ('--best', '--no-lzma')
+      else:
+        method[:0] = ('--ultra-brute', '--lzma')
+    elif has_nonlzma_effort:
+      # Doesn't make a difference, just makes it explicit.
+      method[:0] = ('--no-lzma',)
+    elif has_nrv:  # --nrv... with --brute or --ultra-brute.
+      # This may make a difference.
+      raise ValueError(
+          '--brute or --ultra-brute would shadow --nrv... ; '
+          'specify --best instead.')
+    else:  # --brute or --ultra-brute, but no --lzma.
+      # Doesn't make a difference, just makes it explicit.
+      method[:0] = ('--lzma',)  # Make it explicit.
+  assert '--lzma' in method or '--no-lzma' in method
   return method
 
 
@@ -468,12 +529,12 @@ def upx_compress32(udata, tmp_filename, method=None, need_decompress_code=False)
   """
   if not isinstance(udata, (str, buffer)):
     raise TypeError
-  method = get_upx_method_args(method)
-  has_lzma = '--brute' in method or '--ultra-brute' in method or '--lzma' in method
+  method = get_upx_method_flags(method)
+  assert '--lzma' in method or '--no-lzma' in method
   method[:] = [arg for arg in method if arg != '--small']
   if '--none' in method:
     return upx_make_uncompressed(udata)
-  if not has_lzma:
+  if '--lzma' not in method:
     # --small makes M_LZMA larger (!) by 23 bytes, so we don't apply it.
     # It also makes the M_NRV2A_LE16 a few dozen bytes smaller (avoiding NOPs etc),
     # so we apply it.
@@ -509,7 +570,7 @@ def upx_compress32(udata, tmp_filename, method=None, need_decompress_code=False)
     #
     # * With M_LZMA: decompressor + literal is <3404 bytes, 4096 + 3204 == 7600 bytes
     # * With others: decompressor + literal is  <704 bytes, 4096 +  704 == 4800 bytes
-    padding_size = (7600, 4800)[not has_lzma]
+    padding_size = (4800, 7600)['--lzma' in method]
     elf32_size, elf32_header = run_upx_elf32(
         udata, tmp_filename, method, padding_char, padding_size)
   if not elf32_size:  # ': NotCompressibleException' or ': file is too large'.
@@ -536,10 +597,17 @@ def upx_compress32(udata, tmp_filename, method=None, need_decompress_code=False)
     return ph_method
 
   data = open(tmp_filename, 'rb').read()
-  if need_decompress_code and has_lzma and get_ph_method(data) != 14:
+  if (need_decompress_code and '--lzma' in method and
+      '--small' not in method and get_ph_method(data) != 14):
     # Compress again with --small if we asked for possibly-LZMA, but we
-    # ended up getting a different method. Different methods get a size
+    # ended up getting a non-LZMA method. Non-LZMA methods get a size
     # reduction of about 32 bytes from --small.
+    #
+    # Example input (no flags): tiny7zx.unc
+    #
+    # TODO(pts): Dynamically replace the decompressor with a smaller one
+    # instead of calling UPX again (which can be slow).
+    method[:] = [flag for flag in method if flag != '--lzma']
     method.extend(('--small', '--no-lzma'))
     elf32_size, elf32_header = run_upx_elf32(
         udata, tmp_filename, method, padding_char, padding_size)
@@ -1405,7 +1473,7 @@ def main(argv):
   input_file = None
   output_file = None
   do_decompress = False
-  method_args = []
+  method_flags = []
   input_format = None
   output_format = None
   prefix_size = None
@@ -1428,11 +1496,11 @@ def main(argv):
       break
     arg = '--' + arg.lstrip('-')
     if len(arg) == 3 and arg[2] in '123456789':
-      method_args.append(arg[1:])
+      method_flags.append(arg[1:])
     elif arg in ('--best', '--brute', '--ultra-brute', '--lzma', '--no-lzma',
                  '--nrv2b', '--nrv2d', '--nrv2e', '--small', '--none',
                  '--no-filter', '--all-filters', '--all-methods'):
-      method_args.append(arg)
+      method_flags.append(arg)
     elif arg in ('--q', '--qq', '--qqq'):
       pass  # !! Make this flag useful.
     elif arg in ('--d', '--decompress', '--uncompress'):
@@ -1468,7 +1536,7 @@ def main(argv):
   if i != len(argv):
     sys.exit('fatal: too many command-line arguments')
 
-  method = ' '.join(method_args)
+  method = ' '.join(method_flags)
   tmp_filename = output_file + '.tmp'
   if input_format is None and output_format == 'asm':
     input_format = 'flat32'
