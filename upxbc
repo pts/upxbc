@@ -12,7 +12,9 @@ exec python -- ${1+"$@"}; exit 1
 This script need Python 2.5, 2.6 or 2.7. Python 3.x won't work. Python 2.4
 typically won't work (unless the hashlib module is installed from PyPi).
 
-Typical usage: upxbc --c32 input.c32 output.c32
+Typical usage: upxbc input.c32 output.c32
+
+https://github.com/pts/upxbc
 """
 
 import os
@@ -534,20 +536,6 @@ def get_upx_method_flags(method):
     method = method.replace(',', ' ').split()
   method = ['-' * (1 + (flag not in '123456789')) + flag for flag in
             (flag.strip('-') for flag in method) if flag]
-  #method = '--best --nrv2b'  # Doesn't select with --brute or --ultra-brute. !!
-  #method = '--best --nrv2d'  # Doesn't select with --brute or --ultra-brute.
-  #method = '--best --nrv2e'  # Doesn't select with --brute or --ultra-brute.
-  #method = '--best --small'  # !!  --small also avoids some nops. (Do we still have them in nrv2b? \x90\x90\x90\x90\x90)
-  #method = '--best'
-  #method = '--ultra-brute --small'  # !!
-  #method = '--lzma --small'   # This can force LZMA.
-  #method = '-9'
-  #method = '--ultra-brute --small --no-filter'  # !!
-  #method = '--none'
-  # Example good: '--best'. Doesn't enable LZMA.
-  # Example good: '--brute'. Also enables LZMA.
-  # Example good: '--ultra-brute'. Also enables LZMA.
-  # Example good: '--ultra-brute --lzma'.
 
   has_effort = len([1 for flag in method if flag in UPX_EFFORT_METHOD_FLAGS])
   has_nonlzma_effort = len(
@@ -557,6 +545,7 @@ def get_upx_method_flags(method):
   method_flags = set(
       flag for flag in method if flag in UPX_NRV_METHOD_FLAGS or
       flag == '--lzma' or flag == '--none')
+
   if len(method_flags) > 1:
     # UPX would make the last one take effect.
     raise ValueError(
@@ -2032,7 +2021,12 @@ def main(argv):
   do_set_executable_bit = True
 
   if len(argv) < 2 or argv[1] == '--help':
-    sys.stderr.write('Usage: %s [<flag>...] <input-file> <output-file>\n' % argv[0])
+    sys.stderr.write(
+        'upxbc: UPX-based compressor for execuables and data files\n'
+        'https://github.com/pts/upxbc\n'
+        'This is free software, GNU GPL >=2.0. '
+        'There is NO WARRANTY. Use at your risk.\n'
+        'Usage: %s [<flag>...] <input-file> <output-file>\n' % argv[0])
     sys.exit(0)
     # TODO(pts): Document command-line flags.
 
