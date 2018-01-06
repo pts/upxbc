@@ -915,6 +915,7 @@ def parse_elf32_compressed_by_upx(
       ('ph_checksum', 'B'),
   )
   ph = parse_struct(ph_fields, data[i : i + 32])
+  ph_checksum = sum(ord(c) for c in buffer(data, i + 4, 27)) % 251
   dump_struct(ph_fields, data[i : i + 32])
   overlay_ofs, = struct.unpack('<L', data[i + 32 : i + 36])
   print 'overlay_ofs = 0x%x' % overlay_ofs  # dump_struct. !! Make it optional (e.g. -v for verbose).
@@ -955,7 +956,8 @@ def parse_elf32_compressed_by_upx(
     raise ValueError
   #if ph['ph_n_mru1'] != ...:  # Not stored anywhere else.
   #  raise ValueError
-  # !!! Check the ph_checksum.
+  if ph['ph_checksum'] != ph_checksum:
+    raise ValueError
   if do_check_size and len(compressed_data) >= len(udata):
     return upx_make_uncompressed(udata, need_decompress_code=need_decompress_code)
   if data_b_info['b_method'] == 0:
