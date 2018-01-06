@@ -16,9 +16,11 @@ Features:
   have a specific header.
 * Compressing arbitrary i386 flat executables to GNU assembler .s source
   files, to be included in other programs.
-* (--elftiny) Compressing statically linked Linux i386 executables with
+* (--elftiny) Compressing statically linked Linux i386 ELF executables with
   about 1500 bytes smaller output file size than UPX. This is accomplished
   by generating a smaller stub, at the cost of some security.
+* (--elfstrip) Removing section headers and other stuff from ELF32
+  executables. This is a supercharged `strip -s', similar to sstrip(1).
 * It works better for small files (as small as 512 bytes), where UPX refuses
   to do anything.
 

@@ -938,6 +938,11 @@ def upx_compress32(udata, tmp_filename, method=None, need_decompress_code=False)
       unfilter_code=unfilter_code,
       # Unfortunately we need to pass it for LZMA, because we don't have an
       # alternative compressor easily available.
+      #
+      # !! Make UPX (run_upx_elf32) compress ELF with 2 PT_LOAD sections,
+      #    one of them being large, the other one being arbitrary, and
+      #    containing the ELF header. This makes the other idea
+      #    (`xz --format=raw') unnecessary.
       compressed_elf32_header=str(compressed_elf32_header) * bool(data_b_info['b_method'] == 14))
 
 
@@ -1216,6 +1221,114 @@ def build_elftiny32(text_data, load_addr, entry_addr, end_addr, extra_phdrs, e_o
   return result
 
 
+def strip_elf32(udata):
+  """Strips the section header and other stuff from an ELF32 executable.
+
+  All stuff which is not necessary for running the executable will be
+  removed. What remains is the ELF header, the program header and the
+  segments referenced from the program header.
+
+  This is similar to sstrip
+  (https://github.com/BR903/ELFkickers/tree/master/sstrip), but implemented
+  in pure Python.
+  """
+  if not isinstance(udata, (str, buffer)):
+    raise TypeError
+
+  udata = buffer(udata)
+  if len(udata) < 0x54:
+    raise ValueError
+  ehdr = parse_struct(EHDR_FIELDS, buffer(udata, 0, 0x34))
+  dump_struct(EHDR_FIELDS, buffer(udata, 0, 0x34))
+
+  # This accepts a Linux i386 ELF executable created by pts-xtiny.
+
+  if ehdr['ei_mag'] != '\x7fELF':
+    raise ValueError
+  if ehdr['ei_class'] != 1:
+    raise ValueError
+  if ehdr['ei_data'] != 1:
+    raise ValueError
+  if ehdr['ei_version'] != 1:
+    raise ValueError
+  # Ignore e_osabi.
+  #if ehdr['e_osabi'] not in (0, 3):  # 0: System V, 3: Linux.
+  #  raise ValueError
+  if ehdr['e_abiversion'] != 0:
+    raise ValueError
+  #if ehdr['e_pad'] != '\0\0\0\0\0\0\0':
+  #  raise ValueError
+  if ehdr['e_type'] != 2:
+    raise ValueError('Expected an executable file.')
+  # Ignore e_machine.
+  #if ehdr['e_machine'] != 3:  # x86.
+  #  raise ValueError('Expected i386.')
+  if ehdr['e_version'] != 1:
+    raise ValueError
+  if ehdr['e_ehsize'] != 0x34:
+    raise ValueError
+  if ehdr['e_phentsize'] != 0x20:
+    raise ValueError
+  if ehdr['e_flags'] != 0:
+    raise ValueError
+  if ehdr['e_shentsize'] not in (0, 0x28):
+    raise ValueError
+  if ehdr['e_phoff'] != 0x34:
+    raise ValueError
+  elf32_header_size = ehdr['e_phoff'] + 0x20 * ehdr['e_phnum']
+  if elf32_header_size >= 0x1000:
+    raise ValueError
+  if len(udata) < elf32_header_size:
+    raise ValueError
+  keep_size = elf32_header_size
+
+  udatahd = udata[:elf32_header_size]
+  # Set e_shoff 0.
+  udatahd = ''.join((udatahd[:0x20], '\0\0\0\0', udatahd[0x24:]))
+  # Set e_shnum and e_shstrndx to 0.
+  udatahd = ''.join((udatahd[:0x30], '\0\0\0\0', udatahd[0x34:]))
+
+  for phi in xrange(ehdr['e_phnum']):
+    i = ehdr['e_phoff'] + 0x20 * phi
+    phdrb = buffer(udatahd, i, 0x20)
+    phdr = parse_struct(PHDR_FIELDS, phdrb)
+    dump_struct(PHDR_FIELDS, phdrb)
+    has_changed = False
+    # Fix the header so it becomes UPX-compressible.
+    # Typically it's the output of `gcc -static -Wl,-N'.
+    if (phdr['p_offset'] == elf32_header_size and
+        phdr['p_vaddr'] >= elf32_header_size and
+        phdr['p_type'] != 4):  # PT_NOTE.
+      phdr['p_offset'] = 0
+      phdr['p_vaddr'] -= elf32_header_size
+      phdr['p_paddr'] -= elf32_header_size
+      phdr['p_filesz'] += elf32_header_size
+      phdr['p_memsz'] += elf32_header_size
+      has_changed = True
+    j = phdr['p_offset']
+    k = k0 = j + phdr['p_filesz']
+    j = min(j, elf32_header_size)
+    while j < k and udata[k - 1] == '\0':
+      k -= 1
+    if k != k0:  # Remove trailing '\0' from segment.
+      has_changed = True
+      phdr['p_filesz'] = k - phdr['p_offset']
+    if has_changed:
+      udatahd = ''.join((  # This does a small string copy.
+          udatahd[:i],
+          struct.pack('<' + ''.join(item[1] for item in PHDR_FIELDS),
+                      *(phdr[item[0]] for item in PHDR_FIELDS)),
+          udatahd[i + 0x20:]))
+    keep_size = max(keep_size, k)
+
+  # Keep only the first keep_size bytes.
+  print 'keep_size=0x%x' % keep_size
+  if buffer(udatahd) == buffer(udata, 0, elf32_header_size):
+    return udata[:keep_size]
+  else:
+    return udatahd + udata[elf32_header_size : keep_size]
+
+
 def compress_elftiny32(udata, tmp_filename, method=None):
   """Compresses a statically linked Linux i386 executable.
 
@@ -1318,7 +1431,7 @@ def compress_elftiny32(udata, tmp_filename, method=None):
       phdr['p_filesz'] += elf32_header_size
       phdr['p_memsz'] += elf32_header_size
     else:
-      raise ValueError('p_offset too large: 0x%x' % p_offset)
+      raise ValueError('p_offset too large: 0x%x' % phdr['p_offset'])
   if (phdr['p_flags'] & ~7) != 0:  # Standardize to 7.
     raise ValueError
   if phdr['p_filesz'] > len(udata):
@@ -1637,7 +1750,9 @@ def main(argv):
     elif arg == '--upxz':
       output_format = 'upxz'
     elif arg in ('--elftiny', '--elftiny32'):
-      input_format = 'elftiny32'
+      output_format = 'elftiny32'
+    elif arg in ('--elfstrip', '--elfstrip32'):
+      output_format = 'elfstrip32'
     elif arg.startswith('--prefix='):
       prefix_size = int(arg.split('=', 1)[1], 0)
     elif arg.startswith('--in='):
@@ -1701,8 +1816,11 @@ def main(argv):
     # 0x46 or 0x49), filter_cto. Still we may get a little bit different file
     # for elftiny32.
     data = compress_c32(udata, tmp_filename, method=method)
-  elif input_format == output_format == 'elftiny32':
+  elif input_format == 'elf' and output_format == 'elftiny32':
     data = compress_elftiny32(udata, tmp_filename, method=method)
+    do_set_executable_bit = True
+  elif input_format == 'elf' and output_format == 'elfstrip32':
+    data = strip_elf32(udata)
     do_set_executable_bit = True
   elif (input_format == 'binary' and output_format == 'upxz' and
         not do_decompress):
