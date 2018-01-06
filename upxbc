@@ -187,6 +187,9 @@ def run_upx_elf32(
     if padding < 0:
       raise ValueError
     padding_size = padding = int(padding)
+  if len(udata) + padding_size == 0:
+    # UPX returns garbage in this case.
+    raise ValueError('Cannot compress empty data.')
   padding_data = padding_char * padding_size or ''
   udata2_size = None
   if udata2 is not None:
@@ -219,13 +222,14 @@ def run_upx_elf32(
   cmd.extend(method)
   cmd.extend(('--', tmp_filename))
   print >>sys.stderr, (
-      'info: running with padding_size=%d udata2_size=%d: %s' %
-      (padding_size, len(udata2 or ''), ' ' .join(map(pipes.quote, cmd))))
+      'info: running with udata_size=%d padding_size=%d udata2_size=%d: %s' %
+      (len(udata), padding_size, len(udata2 or ''),
+      ' ' .join(map(pipes.quote, cmd))))
   try:
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
   except OSError:
-    os.unlink(tmp_filename)
+    os.remove(tmp_filename)
     raise RuntimeError('UPX not found: %x' % cmd[0])
   try:
     upx_stdout, upx_stderr = p.communicate('')
@@ -233,7 +237,7 @@ def run_upx_elf32(
     exit_code = p.wait()
   if exit_code:
     #assert 0, (exit_code, upx_stderr, os.stat(tmp_filename).st_size)
-    os.unlink(tmp_filename)
+    os.remove(tmp_filename)
     # 'upx: ...: IOException: file is too small -- skipped\n'
     # 'upx: ...: NotCompressibleException\n'
     # ': file is too small' in upx_stderr or  # We take care of this.
@@ -326,7 +330,7 @@ class UpxCompressed(object):
             for name in sorted(self.__slots__)))
 
 
-def upx_make_uncompressed(udata):
+def upx_make_uncompressed(udata, need_decompress_code=True):
   """Returns UpxCompressed representing the original, uncompressed data."""
   if not isinstance(udata, (str, buffer)):
     raise TypeError
@@ -337,8 +341,8 @@ def upx_make_uncompressed(udata):
       compressed_data=str(udata),
       ubufsize=len(udata),
       # Based on decompress_none.nasm .
-      decompress_code='\x8bD$\x10\x8b\x009D$\x08t\x04\x83\xc8\xff\xc3VW\x8bt$\x0c\x8b|$\x14\x91\xf3\xa4_^1\xc0\xc3',
-      unfilter_code='\xc3',  # ret.
+      decompress_code='\x8bD$\x10\x8b\x009D$\x08t\x04\x83\xc8\xff\xc3VW\x8bt$\x0c\x8b|$\x14\x91\xf3\xa4_^1\xc0\xc3' * bool(need_decompress_code),
+      unfilter_code='\xc3' * bool(need_decompress_code),  # ret.
       compressed_elf32_header='',
   )
 
@@ -523,7 +527,7 @@ def get_upx_method_flags(method):
   #method = '--best --nrv2b'  # Doesn't select with --brute or --ultra-brute. !!
   #method = '--best --nrv2d'  # Doesn't select with --brute or --ultra-brute.
   #method = '--best --nrv2e'  # Doesn't select with --brute or --ultra-brute.
-  #method = '--best --small'  # !!  --small also avoids some nops.
+  #method = '--best --small'  # !!  --small also avoids some nops. (Do we still have them in nrv2b? \x90\x90\x90\x90\x90)
   #method = '--best'
   #method = '--ultra-brute --small'  # !!
   #method = '--lzma --small'   # This can force LZMA.
@@ -540,6 +544,16 @@ def get_upx_method_flags(method):
       [1 for flag in method if flag in UPX_NONLZMA_EFFORT_METHOD_FLAGS])
   has_nrv = len(
       [1 for flag in method if flag in UPX_NRV_METHOD_FLAGS])
+  method_flags = set(
+      flag for flag in method if flag in UPX_NRV_METHOD_FLAGS or
+      flag == '--lzma' or flag == '--none')
+  if len(method_flags) > 1:
+    # UPX would make the last one take effect.
+    raise ValueError(
+        'Multiple method flags specified: %s' % ' '.join(sorted(method_flags)))
+  if method_flags and ('--brute' in method or '--ultra-brute' in method):
+    raise ValueError('Method flags not compatible with --*brute: ' %
+                     ' '.join(sorted(method_flags)))
   if '--none' in method:
     method[:] = [flag for flag in method if flag not in (
         '--none', '--no-filter', '--small', '--bad-ratio-ok')]
@@ -624,122 +638,11 @@ PHDR_FIELDS = (  # ELF program header.
 )
 
 
-def upx_compress32(
-    udata, tmp_filename, method=None, need_decompress_code=False, do_swap=None,
-    load_addr=None):
-  """Compresses !! write docstring
-
-  Tested and works with UPX 3.94.
-
-  The corresponding decompression is not implemented.
-  !! Write a Linux i386 ELF file and run it. Alternatively, distribute a
-     decompressor source for Linux i386 which supports it all.
-
-  !! doc: --no-filter, --all-filters, --all-methods
-
-  The compressed output may be longer than the input (udata), the caller has
-  to decide how to use or discard it.
-
-  Returns:
-    An UpxCompressed object describing the compressed output data.
-  """
-  if not isinstance(udata, (str, buffer)):
-    raise TypeError
-  method = get_upx_method_flags(method)
-  if not ('--lzma' in method or '--no-lzma' in method):
-    raise AssertionError
-  method[:] = [arg for arg in method if arg != '--small']
-  if '--none' in method:
-    return upx_make_uncompressed(udata)
-  if '--lzma' not in method:
-    # --small makes M_LZMA larger (!) by 23 bytes, so we don't apply it.
-    # It also makes the M_NRV2A_LE16 a few dozen bytes smaller (avoiding NOPs etc),
-    # so we apply it.
-    method.append('--small')
-  if do_swap is None:
-    # do_swap=True is better, because it produces empty padding in the
-    # result (result_ch.ubufsize == len(result_ch.compressed_data)).
-    #
-    # Unfortunately do_swap=True makes UPX 3.94 skip using filters and
-    # produce bad (suboptimal) compression ratio, so we can use it here only
-    # if --no-filter and --bad-ratio-ok are specified.
-    do_swap = '--no-filter' in method and '--bad-ratio-ok' in method
-  else:
-    do_swap = bool(do_swap)
-
-  # Some golden values:
-  #
-  # * Input: 'X' * 0xfd1
-  #   Output: .byte 201,168,170,146,88,0,96,20,84,0,0,0,0,0,0,0,144,255  (0x12 bytes)
-  #   Compression: method=M_NRV2B_LE32, filter=0
-  # * Input: 'X' * 0x14af
-  #   Output: .byte 26,3,0,44,111,251,191,254,163,177,94,229,248,63,178,170,38,85,248,104,112,65,112,21,15,141,253,30,75,253,86,255,34,0 (0x22 bytes)
-  #   Compression: method=M_LZMA filter=0
-  #
-
-  elf32_size, elf32_header, padding_data = False, None, None
-  if (not do_swap and '--ultra-brute' in method or '--brute' in method and
-      len(udata) > 1900):
-    # Try with a small padding first, it can save a few bytes (e.g. 4) if
-    # we end up adding less padding.
-    padding=max(4096 - len(udata) - 0x54, 0)
-    elf32_size, elf32_header, padding_data = run_upx_elf32(
-        udata, tmp_filename, method, padding=padding, load_addr=load_addr)
-  if elf32_size is False:  # ': NotCompressibleException' or first run.
-    # Since we are using padding=bool(...), there is no need to avoid the UPX
-    # error: ': file is too small' by adding padding (for
-    # Packer::checkDefaultCompressionRatio), which is OK with at least 4096
-    # bytes or 6.25% gain.
-    padding=bool(do_swap)
-    elf32_size, elf32_header, padding_data = run_upx_elf32(
-        udata, tmp_filename, method, padding=padding, load_addr=load_addr)
-    # ': NotCompressibleException'.
-    if elf32_size is False and len(udata) <= 0x2000:
-      # We've specified padding=bool(...), this should have taken care of it.
-      raise RuntimeError('NotCompressibleException not expected.')
-  if not elf32_size:  # ': NotCompressibleException' or ': file is too large'.
-    return upx_make_uncompressed(udata)
-
-  # The upx binary calls upx_ucl_compress and upx_lzma_compress is called
-  # with 3 or 4 different block sizes:
-  #
-  # * 0x54 or 0x74 (for the ELF32 header)
-  # * 0x65e == 1630 this is the modified stub_i386_linux_elf_fold of uncompressed size sizeof(stub_i386_linux_elf_fold) - fold_hdrlen == 1758 - 128 == 1630
-  #    buildLinuxLoader(
-  #      stub_i386_linux_elf_entry, sizeof(stub_i386_linux_elf_entry),
-  #      tmp,                       sizeof(stub_i386_linux_elf_fold),  ft );
-  # * len(udata)
-  # * len(padding_data)  (Combined with the previous block if do_swap=False).
-
-  def get_ph_method(data):
-    if len(data) < 36:
-      raise ValueError('Shorter than PackHeader.')
-    if data[-36 : -32] != 'UPX!':
-      raise ValueError('Missing UPX signature in PackHeader.')
-    ph_method = ord(data[-30])
-    if ph_method not in (2, 5, 8, 14):
-      raise ValueError('Bad ph_method: %d' % ph_method)
-    return ph_method
-
-  data = open(tmp_filename, 'rb').read()
-  if (need_decompress_code and '--lzma' in method and
-      '--small' not in method and get_ph_method(data) != 14):
-    # Compress again with --small if we asked for possibly-LZMA, but we
-    # ended up getting a non-LZMA method. Non-LZMA methods get a size
-    # reduction of about 32 bytes from --small.
-    #
-    # Example input (no flags): tiny7zx.unc
-    #
-    # !!! Call upx on a smaller data (and same filter?). addFilter32 doesn't
-    #     depend on --small, so we could reuse the same filter.
-    method[:] = [flag for flag in method if flag != '--lzma']
-    method.extend(('--small', '--no-lzma'))
-    elf32_size, elf32_header, padding_data = run_upx_elf32(
-        udata, tmp_filename, method, padding=padding, load_addr=load_addr)
-    data = open(tmp_filename, 'rb').read()
-    if get_ph_method(data) == 14:
-      raise ValueError('LZMA not expected.')
-
+def parse_elf32_compressed_by_upx(
+    data, udata, padding_data, do_swap, elf32_size, elf32_header,
+    need_decompress_code, decompress_code=None, unfilter_code=None,
+    do_check_size=True):
+  """Returns an UpxCompressed object."""
   i = 0
   ehdr = parse_struct(EHDR_FIELDS, data[i : i + 0x34])
   dump_struct(EHDR_FIELDS, data[i : i + 0x34])  # !! Make these calls optional.
@@ -852,13 +755,21 @@ def upx_compress32(
   last_b_info = data_b_info = padding_b_info = None
   c_adler32 = 1  # zlib.adler32('').
   compressed_elf32_header = None
-  # There are 3 compressed blocks here:
+
+  # The upx binary calls upx_ucl_compress and upx_lzma_compress is called
+  # with 3 or 4 different block sizes:
   #
-  # * 0x74 bytes: The compressed ELF32 header.
-  # * The compressed padding.
-  # * Our compressed udata.
+  # * 0x54 or 0x74 (for the ELF32 header). This is block 0 here.
+  # * 0x65e == 1630 this is the modified stub_i386_linux_elf_fold of uncompressed size sizeof(stub_i386_linux_elf_fold) - fold_hdrlen == 1758 - 128 == 1630
+  #    buildLinuxLoader(
+  #      stub_i386_linux_elf_entry, sizeof(stub_i386_linux_elf_entry),
+  #      tmp,                       sizeof(stub_i386_linux_elf_fold),  ft );
+  #   This is not present in a block here, it's in FOLDEXEC, after load_end_ofs.
+  # * len(udata) + len(padding_data). This is block 1 here if do_swap=False.
+  # * len(padding_data). This is block 1 here if do_swap=False.
+  # * len(udata). This is block 2 here if do_swap=True.
   for _ in xrange(2 + bool(do_swap)):
-    # Lots of filters (b_ftid) in filteri.cpp .
+    # Lots of filters (b_ftid) are defined in src/filteri.cpp .
     # Packer::getDecompressorSections (contains NRV and LZMA)
     # Method can be (for elf32):
     # * with --small: (!! which is the default? which one is smaller? should we specify --small? also for bmcompress.py?)
@@ -935,6 +846,10 @@ def upx_compress32(
     if data_b_info['sz_unc'] != len(udata) + len(padding_data):
       raise ValueError
   compressed_data = buffer(data, data_b_info['c_ofs'], data_b_info['sz_cpr'])
+  # This can happen when compressing '\0' with padding=True.
+  if data_b_info['b_method'] == 0:
+    if buffer(udata) != compressed_data:
+      raise ValueError
 
   # See funpad4(fi) in PackLinuxElf32::unpack.
   i += (-i & 0x3)  # Round up to 4 bytes.
@@ -1015,7 +930,8 @@ def upx_compress32(
     raise ValueError
   if ph['ph_format'] != l_info['l_format']:
     raise ValueError
-  if ph['ph_method'] != data_b_info['b_method']:
+  if (ph['ph_method'] != data_b_info['b_method'] and
+      data_b_info['b_method'] != 0):
     raise ValueError
   #if ph['ph_level'] != ...:  # Not stored anywhere else.
   #  raise ValueError
@@ -1039,16 +955,19 @@ def upx_compress32(
     raise ValueError
   #if ph['ph_n_mru1'] != ...:  # Not stored anywhere else.
   #  raise ValueError
-  #os.unlink(tmp_filename)
-  # !! Check the ph_checksum.
-  if len(compressed_data) >= len(udata):
-    return upx_make_uncompressed(udata)
+  # !!! Check the ph_checksum.
+  if do_check_size and len(compressed_data) >= len(udata):
+    return upx_make_uncompressed(udata, need_decompress_code=need_decompress_code)
+  if data_b_info['b_method'] == 0:
+    raise ValueError
 
   i = data.find('\n\0$Info: This file is packed with the UPX executable packer http://upx.sf.net $\n\0$Id: UPX ', loader_ofs)  # identbig.
   if i < 0:
     i = data.find(' the UPX Team. All Rights Reserved. http://upx.sf.net $\n\0', loader_ofs)  # identsmall.
     if i < 0:
-      raise ValueError('UPX end-of-decompress signature not found.')
+      # This can be cause by --small being specified at least twice (then it
+      # will have only UPX_VERSION_STRING4, i.e. "3.94\0").
+      raise ValueError('UPX end-of-decompress signature not found: %r.' % data[loader_ofs:])
     if data[i - 23 : i - 4] != '\n$Id: UPX (C) 1996-':
       raise ValueError
     i -= 23
@@ -1056,20 +975,22 @@ def upx_compress32(
   # compressed FOLDEXEC (stub_i386_linux_elf_fold), which is <1630 bytes
   # (less because of compression).
   loader_end_ofs = i
-  if (need_decompress_code and
+  if (do_check_size and need_decompress_code and
       len(compressed_data) + (loader_end_ofs - loader_ofs) >=
       len(udata) + 0x10):
     return upx_make_uncompressed(udata)
   if data_b_info['b_ftid'] != 0:
     decompress_ofs = lexec000_ofs + 7 + ord(data[lexec000_ofs + 6])
-    decompress_code = data[decompress_ofs : loader_end_ofs]
-    unfilter_code = data[lexec000_ofs + 7 : decompress_ofs]
+    if decompress_code is None:
+      decompress_code = data[decompress_ofs : loader_end_ofs]
+    if unfilter_code is None:
+      unfilter_code = data[lexec000_ofs + 7 : decompress_ofs]
     filter_cto = data_b_info['b_cto8']
   else:
-    decompress_code = data[lexec000_ofs + 5 : loader_end_ofs]
+    if decompress_code is None:
+      decompress_code = data[lexec000_ofs + 5 : loader_end_ofs]
     unfilter_code = '\xc3'  # ret, unused.
     filter_cto = 0
-  os.unlink(tmp_filename)  # Keep it if there is an exception.
 
   # !! Get new stats, with details on len(decompress_code) etc.
   # method=M_LZMA filter=0 decompress_size=2835
@@ -1087,11 +1008,190 @@ def upx_compress32(
       filter_cto=filter_cto,
       compressed_data=str(compressed_data),
       ubufsize=data_b_info['sz_unc'],
-      decompress_code=decompress_code,
+      decompress_code=str(decompress_code),
       unfilter_code=unfilter_code,
       # Unused by default, will be used only with
       # compress_upxz(..., do_add_compressed_elf32_header=False).
       compressed_elf32_header=str(compressed_elf32_header))
+
+
+def get_ph_info(data):
+  if len(data) < 36:
+    raise ValueError('data Shorter than PackHeader.')
+  if data[-36 : -32] != 'UPX!':
+    raise ValueError('Missing UPX signature in PackHeader.')
+  ph_method = ord(data[-30])
+  if ph_method not in (2, 5, 8, 14):
+    raise ValueError('Bad ph_method: 0x%x' % ph_method)
+  ph_filter = ord(data[-8])
+  # UPX 3.94 supports only these filters.
+  #if ph_filter not in (0, 0x46, 0x49):
+  #  raise ValueError('Bad filter: 0x%x' % ph_filter)
+  return ph_method, ph_filter
+
+
+def get_flag_for_method(ph_method):
+  if ph_method == 2:
+    return '--nrv2b'
+  elif ph_method == 5:
+    return '--nrv2d'
+  elif ph_method == 8:
+    return '--nrv2e'
+  else:
+    return None
+
+
+def get_decompress_code(ph_method, ph_filter, tmp_filename2):
+  # In theory it can work with more filters, we just have to try.
+  if ph_method not in (2, 5, 8) or ph_filter not in (0, 0x46, 0x49):
+    return None, None
+  method_flag = get_flag_for_method(ph_method)
+  method = [get_flag_for_method(ph_method), '--no-lzma', '--small', '-1',
+            '--filter=0x%x' % ph_filter]
+  if '--small' not in method:
+    method.append('--small')
+  # Magic code to trigger the filter (ch2.filter != 0) in UPX. Contains
+  # 5 `call' instructions.
+  udata2 = ('\xe8\xfb\xff\xff\xff\x90\xe8\xf6\xff\xff\xff\x90\xe8\xf1\xff\xff'
+            '\xff\x90\xe8\xec\xff\xff\xff\x90\xe8\xe7\xff\xff\xff\x90')
+  elf32_size2, elf32_header2, padding_data2 = run_upx_elf32(
+      udata2, tmp_filename2, method, padding=False)
+  if len(elf32_header2) != 0x54:
+    raise ValueError
+  data2 = open(tmp_filename2, 'rb').read()
+  ph_method2, ph_filter2 = get_ph_info(data2)
+  if ph_method != ph_method2 or ph_filter != ph_filter2:
+    raise ValueError(((ph_method, ph_filter), (ph_method2, ph_filter2)))
+  ch2 = parse_elf32_compressed_by_upx(
+      data2, udata2, padding_data2, False, elf32_size2, elf32_header2,
+      need_decompress_code=True, do_check_size=False)
+  if ph_method != ch2.method or ph_filter != ch2.filter:
+    raise ValueError(((ph_method, ph_filter), (ch2.method, ch2.filter)))
+  os.remove(tmp_filename2)  # Keep it if there was an exception.
+  # len(decompress_code): --nrv2b --small: --no-filter:186 --filter=0x46:234
+  # --filter=0x49:258 bytes. The size is a bit misleading, because
+  # decompress_code contains part of unfilter_code (sigh).
+  return ch2.decompress_code, ch2.unfilter_code
+
+
+def upx_compress32(
+    udata, tmp_filename, method=None, need_decompress_code=False, do_swap=None,
+    load_addr=None):
+  """Compresses !! write docstring
+
+  Tested and works with UPX 3.94.
+
+  The corresponding decompression is not implemented.
+  !! Write a Linux i386 ELF file and run it on Linux.
+     Alterantively, save the settings (ph_method, ph_filter, ph_filter_cto),
+     and also 4 bytes of adler32 checksum to the file, and pass it to upx -d.
+
+  !! doc: --no-filter, --all-filters, --all-methods
+
+  The compressed output may be longer than the input (udata), the caller has
+  to decide how to use or discard it.
+
+  Returns:
+    An UpxCompressed object describing the compressed output data.
+  """
+  if not isinstance(udata, (str, buffer)):
+    raise TypeError
+  method = get_upx_method_flags(method)
+  if not ('--lzma' in method or '--no-lzma' in method):
+    raise AssertionError
+  method[:] = [arg for arg in method if arg != '--small']
+  if '--none' in method or not udata:
+    return upx_make_uncompressed(udata)
+  if '--lzma' not in method:
+    # --small makes M_LZMA larger (!) by 23 bytes, so we don't apply it.
+    # It also makes the M_NRV2A_LE16 a few dozen bytes smaller (avoiding NOPs etc),
+    # so we apply it.
+    method.append('--small')
+  if do_swap is None:
+    # do_swap=True is better, because it produces empty padding in the
+    # result (result_ch.ubufsize == len(result_ch.compressed_data)).
+    #
+    # Unfortunately do_swap=True makes UPX 3.94 skip using filters and
+    # produce bad (suboptimal) compression ratio, so we can use it here only
+    # if --no-filter and --bad-ratio-ok are specified.
+    do_swap = '--no-filter' in method and '--bad-ratio-ok' in method
+  else:
+    do_swap = bool(do_swap)
+
+  # Some golden values:
+  #
+  # * Input: 'X' * 0xfd1
+  #   Output: .byte 201,168,170,146,88,0,96,20,84,0,0,0,0,0,0,0,144,255  (0x12 bytes)
+  #   Compression: method=M_NRV2B_LE32, filter=0
+  # * Input: 'X' * 0x14af
+  #   Output: .byte 26,3,0,44,111,251,191,254,163,177,94,229,248,63,178,170,38,85,248,104,112,65,112,21,15,141,253,30,75,253,86,255,34,0 (0x22 bytes)
+  #   Compression: method=M_LZMA filter=0
+  #
+
+  elf32_size, elf32_header, padding_data = False, None, None
+  if (not do_swap and
+      # We need to accept --best here as well, in case --nrv2b is specified.
+      ('--ultra-brute' in method or '--brute' in method or '--best' in method)
+      and len(udata) > 1900):
+    # Try with a small padding first, it can save a few bytes (e.g. 4) if
+    # we end up adding less padding.
+    padding=max(4096 - len(udata) - 0x54, 0)
+    elf32_size, elf32_header, padding_data = run_upx_elf32(
+        udata, tmp_filename, method, padding=padding, load_addr=load_addr)
+  if elf32_size is False:  # ': NotCompressibleException' or first run.
+    # Since we are using padding=bool(...), there is no need to avoid the UPX
+    # error: ': file is too small' by adding padding (for
+    # Packer::checkDefaultCompressionRatio), which is OK with at least 4096
+    # bytes or 6.25% gain.
+    padding=bool(do_swap)
+    elf32_size, elf32_header, padding_data = run_upx_elf32(
+        udata, tmp_filename, method, padding=padding, load_addr=load_addr)
+    # ': NotCompressibleException'.
+    if elf32_size is False and len(udata) <= 0x2000:
+      # We've specified padding=bool(...), this should have taken care of it.
+      raise RuntimeError('NotCompressibleException not expected.')
+  if not elf32_size:  # ': NotCompressibleException' or ': file is too large'.
+    return upx_make_uncompressed(udata)
+
+  data = open(tmp_filename, 'rb').read()
+
+  ph_method, ph_filter = get_ph_info(data)
+  decompress_code = unfilter_code = None
+  # Example input (no flags): tiny7zx.unc
+  if (need_decompress_code and '--lzma' in method and
+      '--small' not in method and ph_method != 14):
+    # Be smart: call UPX with small dummy data, extract the decompress_code.
+    decompress_code, unfilter_code = get_decompress_code(
+        ph_method, ph_filter, tmp_filename)
+    tmp_filename = None  # Don't remove the file below.
+    if decompress_code is None:  # get_decompress_code failed.
+      # Compress again with --small if we asked for possibly-LZMA, but we
+      # ended up getting a non-LZMA method. Non-LZMA methods get a size
+      # reduction of about 32 bytes from --small.
+      method_flag = get_flag_for_method(ph_method)
+      if method_flag is not None:
+        # No need to remove --lzma or --nrv2b, the last takes effect.
+        if '--ultra-brute' in method or '--brute' in method:
+          # This doesn't seem tho make the the file larger.
+          method[:] = [flag for flag in method if flag != '--ultra-brute'
+                       and flag != '--brute']
+          method.append('--best')
+        method.append('--no-lzma')  # Even --ultra-brute respects this.
+        method.append('--small')
+        method.append(method_flag)
+      elf32_size, elf32_header, padding_data = run_upx_elf32(
+          udata, tmp_filename, method, padding=padding, load_addr=load_addr)
+      data = open(tmp_filename, 'rb').read()
+      if get_ph_info(data)[0] == 14:
+        raise ValueError('LZMA not expected.')
+
+  ch = parse_elf32_compressed_by_upx(
+      data, udata, padding_data, do_swap, elf32_size, elf32_header,
+      need_decompress_code,
+      decompress_code=decompress_code, unfilter_code=unfilter_code)
+  if tmp_filename is not None:
+    os.remove(tmp_filename)  # Keep it if there was an exception.
+  return ch
 
 
 # Hardcoded, so .upxz files remain decompressible in the future.
@@ -1175,14 +1275,14 @@ def decompress_upxz(upxz_data, tmp_filename):
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
   except OSError:
-    os.unlink(tmp_filename)
+    os.remove(tmp_filename)
     raise RuntimeError('UPX not found: %x' % cmd[0])
   try:
     upx_stdout, upx_stderr = p.communicate('')
   finally:
     exit_code = p.wait()
   if exit_code:
-    os.unlink(tmp_filename)
+    os.remove(tmp_filename)
     sys.stderr.write(upx_stderr)
     raise RuntimeError('UPX failed with exit_code=0x%x.' % exit_code)
   # Don't print upx_stdout, it just contains statistics as a one-liner.
@@ -1193,7 +1293,7 @@ def decompress_upxz(upxz_data, tmp_filename):
     udata = f.read(udata_size)  # Can be smaller than ch.ubufsize. Good.
   finally:
     f.close()
-  os.unlink(tmp_filename)
+  os.remove(tmp_filename)
   if elf32_header != get_elf32_header(ch.ubufsize):
     raise ValueError('Unexpected ELF32 header from UPX.')
   if len(udata) != udata_size:
@@ -1804,19 +1904,19 @@ def compress_with_upx(udata, tmp_filename, method=None, do_decompress=False):
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
   except OSError:
-    os.unlink(tmp_filename)
+    os.remove(tmp_filename)
     raise RuntimeError('UPX not found: %x' % cmd[0])
   try:
     upx_stdout, upx_stderr = p.communicate('')
   finally:
     exit_code = p.wait()
   if exit_code:
-    os.unlink(tmp_filename)
+    os.remove(tmp_filename)
     sys.stderr.write(upx_stderr)
     raise RuntimeError('UPX failed with exit_code=0x%x.' % exit_code)
   # Don't print upx_stdout, it just contains statistics as a one-liner.
   data = open(tmp_filename, 'rb').read()
-  os.unlink(tmp_filename)
+  os.remove(tmp_filename)
   return data
 
 
@@ -1941,6 +2041,8 @@ def main(argv):
     elif arg in ('--best', '--brute', '--ultra-brute', '--lzma', '--no-lzma',
                  '--nrv2b', '--nrv2d', '--nrv2e', '--small',
                  '--no-filter', '--all-filters', '--all-methods'):
+      method_flags.append(arg)
+    elif arg.startswith('--filter='):
       method_flags.append(arg)
     elif arg in ('--q', '--qq', '--qqq'):
       pass  # !! Make this flag useful.
