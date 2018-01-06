@@ -1,0 +1,7 @@
+small_lzma.in is a small file which benefits from `upx --lzma' compression,
+b_info['sz_cpr'] is 223 bytes, and the input file is 228 bytes.
+
+With non-LZMA, the copressed output is even smaller: --nrv2b and the default
+produces 212 bytes.
+
+$ upxbc --upxz --lzma small_lzma.in small_lzma.in.upxz

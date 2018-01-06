@@ -1,0 +1,12 @@
+#include <stdio.h>
+
+int answer = 42;
+
+int main(int argc, char **argv) {
+  (void)argv;
+  printf("Hello%d, %s! (%d)\n", answer, "World", argc);
+  return 0;
+}
+
+/* This is a bit longer to make it compressible. */
+/* Even longer. */
