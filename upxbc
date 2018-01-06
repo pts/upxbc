@@ -26,6 +26,7 @@ import zlib
 
 def parse_struct(fields, data):
   values = struct.unpack('<' * (fields[0][1][0] not in '<>') + ''.join(f[1] for f in fields), data)
+  # TODO(pts): Convert long to int if needed.
   return dict(zip((f[0] for f in fields), values))
 
 
@@ -42,17 +43,17 @@ def dump_struct(fields, data):
   print '---/Header'
 
 
-def get_elf32_header(ubufsize, load_addr=0x101000, ubufsize2=None):
+def get_elf32_header(ubufsize, load_addr=None, ubufsize2=None):
   # ELF 32-bit LSB  executable, Intel 80386, version 1 (GNU/Linux), statically linked, stripped.
   # Contains ELF EHDR and 1 PHDR (program header).
-  #
-  # Doesn't make a difference in UpxCompressed, using a small value.
-  #load_addr = 0x8048000
-  # Works for compression, doesn't work for decompresson.
-  #load_addr = 0x200
-  # Minimum value that works for decompression. Smaller values produce:
-  # ': compressed data violation'.
-  #load_addr = 0x101000
+  if load_addr is None:
+    # Doesn't make a difference in UpxCompressed, using a small value.
+    #load_addr = 0x8048000
+    # Works for compression, doesn't work for decompresson.
+    #load_addr = 0x200
+    # Minimum value that works for decompression. Smaller values produce:
+    # ': compressed data violation'.
+    load_addr = 0x101000
   if load_addr & 0xff:  # It would work even without alignment. Just for sanity.
     raise ValueError('load_addr not aligned.')
   if ubufsize2 is None:
@@ -99,14 +100,31 @@ def get_upx_prog():
   return (os.path.dirname(__file__) or '.') + '/tools/upx'
 
 
-def run_upx_elf32(udata, tmp_filename, method, padding_char='\0', padding_size=0, udata2=None, do_swap=False):
+def run_upx_elf32(
+    udata, tmp_filename, method, padding_char='\0', padding=0, udata2=None,
+    load_addr=None):
   """Creates an ELF32 file and runs UPX to compress it.
 
   The compressed file is written to tmp_filename. (Upon an exception, the
   contents and existence of tmp_filename is undefined.)
 
+  Args:
+    udata: str or bytes, to be compressed. Will be saved to the first
+        PT_LOAD segment.
+    udata2: str, bytes or None, to be compressed. If None, ignored, otherwise
+        it will be saved to the second PT_LOAD segment.
+    padding: A nonnegative integer or True or False. If not 0 is specified,
+        it may affect data and udata. For positive integers, the specified
+        amount of padding_char will be appended to udata. If it is bool and
+        it is False, then a magic long enough padding will be appended to
+        udata. If it is bool and it is True, then a magic long enough
+        padding will be put to udata, and the original udata will be put to
+        udata2. The True value usually makes UPX produce a suboptimal
+        compression ratio, and it never uses a filter, so `method' must
+        contain '--no-filter' and '--bad-ratio-ok' in this case to avoid
+        confusion.
   Returns:
-    (uncompressed_elf32_size, uncompressed_elf32_header, final_udata2).
+    (uncompressed_elf32_size, uncompressed_elf32_header, padding_data).
   """
   if not isinstance(udata, (str, buffer)):
     raise TypeError
@@ -114,41 +132,81 @@ def run_upx_elf32(udata, tmp_filename, method, padding_char='\0', padding_size=0
     raise TypeError
   if len(padding_char) != 1:
     raise ValueError
+  if '--none' in method:
+    raise ValueError('run_upx_elf32 does not support --none.')
 
-  if padding_size is True and udata2 is None:
-    # Now we try to ensure a gain of >=4096 bytes, so UPX won't report
+  if padding is True or padding is False:
+    if udata2 is not None:
+      raise ValueError('padding as bool does not work with udata2.')
+    # Now we try to ensure a gain of >=4096 bytes, so that UPX won't report
     # ': NotCompressibleException'. To do so, we add some trailing padding which is
     # very much compressible. We don't want to add a proportional padding, because
     # ultimately we want to keep uncompressible input unchanged.
     #
     # * With M_LZMA: decompressor + literal is <3404 bytes, 4096 + 3204 == 7600 bytes
     # * With others: decompressor + literal is  <704 bytes, 4096 +  704 == 4800 bytes
+    #
+    # Please note that with UPX 3.94, even if we add 10000 0 bytes of
+    # padding to udata2, UPX may still report ': NotCompressibleException'
+    # if udata + padding_data is not compressible (e.g. 10000 0 bytes in
+    # udata2, empty udata, 1900 0 bytes in padding_data makes UPX fail, but
+    # 2000 0 bytes in padding_data works; 10000 0 bytes in udata2, 1500
+    # uncompressible random bytes in udata, 500 0 bytes in padding data
+    # makes UPX fail). So no matter how much padding we add to udata2, it
+    # doesn't help if udata + padding_data is uncompressible. Our solution:
+    # we add all the padding to padding_data, and keep udata2 empty.
     padding_size = (4800, 7600)['--lzma' in method]
-    #padding_size = 1  # !!  # NotCompressibleException :-( .
-    # Moving udata to udata2, otherwise UPX would report NotCompressibleException.
-    # !!! Is it still true?
-    if do_swap:  # !!! Don't choose this, this makes UPX always pick filter 0 for the main data.
+    if padding:
+      # With padding=True, UPX may choose suboptimal compressing settings
+      # (even with --ultra-brute), because UPX 3.94 calculates the
+      # determines the compression method and parameters based on how each
+      # candidate performs on udata + padding_data (i.e. the first PT_LOAD).
+      # Since in this case, we'd be passing only padding_data (all 0 bytes)
+      # with empty udata, UPX will choose method 2 (M_NRV2B_LE32) with some
+      # suboptimal parameters for the real udata. Even if we specify
+      # --nrv2d, --nrv2e or --lzma, the parameters are still suboptimal.
+      # (Example: examples/hello_banchmark.static with glibc 2.19, 664560
+      # bytes, best method is --lzma, then --nrv2e, but UPX here would
+      # still choose M_NRV2B_LE32.)
+      #
+      # To avoid misunderstandings, we explicitly fail here if
+      # --bad-ratio-ok is not specified.
+      if '--bad-ratio-ok' not in method:
+        raise ValueError(
+            'Compression ratio with padding=True is usually bad, '
+            'specify --bad-ratio-ok if it is OK.')
+      if '--no-filter' not in method:
+        # Because of https://github.com/upx/upx/issues/171, UPX 3.94 never
+        # applies a filter in this case, so to avoid confusion we require
+        # --no-filter explicitly.
+        raise ValueError('padding=True needs --no-filter.')
       udata, udata2 = '', udata
-      # !!! Does upx still compare methods properly?
-    else:  # !!! UPX can choose the right filter here, but it still reports NotCompressibleException with this (even for 4600 0 bytes with --lzma; works for 4700 though), no matter how much padding we add to udata2.
-      # !!! Also 1900 bytes doesn't work with --best, but 2000 0 bytes work.
-      # !!! Also zr2000 (1500 random bytes and 500 bytes) is also NotCompressibleException with best.
-      udata2 = '\0' * padding_size
-      padding_size = 0
-
+  else:
+    if not isinstance(padding, (int, long)):
+      raise ValueError
+    if padding < 0:
+      raise ValueError
+    padding_size = padding = int(padding)
+  padding_data = padding_char * padding_size or ''
   udata2_size = None
   if udata2 is not None:
     udata2_size = len(udata2)
+
+  if '--bad-ratio-ok' in method:
+    method = [flag for flag in method if flag != '--bad-ratio-ok']
   elf32_size = (0x54 + 0x20 * (udata2 is not None) +
                 len(udata) + padding_size + (udata2_size or 0))
-  elf32_header = get_elf32_header(len(udata) + padding_size, ubufsize2=udata2_size)
-  assert len(elf32_header) == 0x54 + 0x20 * (udata2 is not None)
+  elf32_header = get_elf32_header(
+      len(udata) + padding_size, ubufsize2=udata2_size, load_addr=load_addr)
+  if len(elf32_header) != 0x54 + 0x20 * (udata2 is not None):
+    raise AssertionError
+  #assert 0, (padding_data, udata2)
   f = open(tmp_filename, 'wb')
   try:
     f.write(elf32_header)
     f.write(udata)
-    if padding_size > 0:  # Avoid UPX error: ': file is too small'.
-      f.write(padding_char * padding_size)
+    if padding_data:
+      f.write(padding_data)
     if udata2 is not None:
       f.write(udata2)
   finally:
@@ -157,11 +215,12 @@ def run_upx_elf32(udata, tmp_filename, method, padding_char='\0', padding_size=0
 
   # -qqq is totally quiet, it doesn't even print the exception.
   # -qq prints one line with the sizes.
-  cmd = [get_upx_prog()]  # !!! -qq
+  cmd = [get_upx_prog(), '-qq']
   cmd.extend(method)
   cmd.extend(('--', tmp_filename))
-  print >>sys.stderr, 'info: running with padding_size=%d: %s' % (
-      padding_size, ' ' .join(map(pipes.quote, cmd)))
+  print >>sys.stderr, (
+      'info: running with padding_size=%d udata2_size=%d: %s' %
+      (padding_size, len(udata2 or ''), ' ' .join(map(pipes.quote, cmd))))
   try:
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -179,17 +238,14 @@ def run_upx_elf32(udata, tmp_filename, method, padding_char='\0', padding_size=0
     # 'upx: ...: NotCompressibleException\n'
     # ': file is too small' in upx_stderr or  # We take care of this.
     if ': NotCompressibleException' in upx_stderr:
-      assert 0, upx_stderr
       return False, None, None
     if ': file is too large' in upx_stderr:
-      return None, None
+      return None, None, None
     sys.stderr.write(upx_stderr)
     raise RuntimeError('UPX failed with exit_code=0x%x.' % exit_code)
   # Don't print upx_stdout, it just contains statistics as a one-liner.
   #sys.stderr.write(upx_stderr)
-  if do_swap:
-    udata2 = udata + padding_char * padding_size
-  return elf32_size, elf32_header, udata2
+  return elf32_size, elf32_header, padding_data
 
 
 class UpxCompressed(object):
@@ -321,7 +377,8 @@ def pack_fields(fields):
       while len(buf) < value and i > 0:
         i -= 1
         buf = output[i] + buf
-      assert len(buf) == value
+      if len(buf) != value:
+        raise AssertionError
       output.append(chr(sum(ord(c) for c in buf) % 251))
     elif format == '.minsize':
       size = sum(len(x) for x in output)
@@ -334,7 +391,7 @@ def pack_fields(fields):
 
 
 def build_elf32_for_upx_decompression(
-    ch, compressed_elf32_header, udata_size, udata_adler32):
+    ch, tmp_filename, udata_size, udata_adler32, load_addr):
   """Builds a Linux i386 ELF executable which UPX can decompress."""
   if udata_size > ch.ubufsize:
     raise ValueError
@@ -343,14 +400,20 @@ def build_elf32_for_upx_decompression(
   elf32_header = get_compressed_elf32_header(ch.ubufsize, method=0)
   if ch.method in (2, 5, 8):
     compressed_elf32_header = get_compressed_elf32_header(
-        ch.ubufsize, method=ch.method)
-  elif ch.method == 14:
-    # !!! still we need padding for --upxz compression of small files (unless with --no-filter)
-    #     Now: ./upxbc --upxz --lzma hello.c hello.c.upxz
-    #         NotCompressibleException
-    # !!! Specify better t.tmp file.
-    compressed_elf32_header = upx_compress32(  # !!!  doc: why do_swap etc.
-        elf32_header, 't.tmp', method='--lzma --no-filter', need_decompress_code=False, do_swap=True).compressed_data
+        ch.ubufsize, method=ch.method, load_addr=load_addr)
+  elif ch.method == 14 and not ch.compressed_elf32_header:
+    # We don't care about compression ratio here, because
+    # compressed_elf32_header is just temporary.
+    ch2 = upx_compress32(
+        elf32_header, tmp_filename, method='--lzma --no-filter --bad-ratio-ok')
+    if ch2.ubufsize != 0x54:
+      raise AssertionError('Unexpected padding in LZMA-compressed ELF32 header.')
+    compressed_elf32_header = ch2.compressed_data
+    del ch2
+  elif not ch.compressed_elf32_header:
+    raise ValueError('compressed_elf32_header empty.')
+  else:
+    compressed_elf32_header = ch.compressed_elf32_header
 
   if not compressed_elf32_header:
     raise ValueError
@@ -359,7 +422,6 @@ def build_elf32_for_upx_decompression(
   loader_ofs = bend_ofs + (-bend_ofs & 3)
   l_version = 13
   l_format = 12
-  load_addr = 0x101000
   fields = (
       ('ei_mag', '4s', '\x7fELF'),
       ('ei_class', 'B', 1),
@@ -480,18 +542,10 @@ def get_upx_method_flags(method):
       [1 for flag in method if flag in UPX_NRV_METHOD_FLAGS])
   if '--none' in method:
     method[:] = [flag for flag in method if flag not in (
-        '--none', '--no-filter', '--small')]
+        '--none', '--no-filter', '--small', '--bad-ratio-ok')]
     if method:
       raise ValueError('--none must be specified alone.')
-    return ['--none']
-  #if not has_effort:
-  #  #method[:0] = ('--ultra-brute',)  # Can negate --lzma.
-  #  method[:0] = ('--best',)
-  # just --brute enables LZMA and non-LZMA
-  # just --ultra-brute enables LZMA and non-LZMA
-  # --ultra-brute --no-lzma  prevents --lzma
-  # !! --best doesn't enable --lzma by default
-  # !! `--best --lzma' and `--lzma --best' force LZMA,
+    return ['--none', '--no-lzma']
   if '--no-lzma' in method:
     if '--lzma' in method:
       raise ValueError('Both --lzma and --no-lzma was specified.')
@@ -529,7 +583,8 @@ def get_upx_method_flags(method):
     else:  # --brute or --ultra-brute, but no --lzma.
       # Doesn't make a difference, just makes it explicit.
       method[:0] = ('--lzma',)  # Make it explicit.
-  assert '--lzma' in method or '--no-lzma' in method
+  if not ('--lzma' in method or '--no-lzma' in method):
+    raise AssertionError
   return method
 
 
@@ -569,7 +624,9 @@ PHDR_FIELDS = (  # ELF program header.
 )
 
 
-def upx_compress32(udata, tmp_filename, method=None, need_decompress_code=False, do_swap=False):
+def upx_compress32(
+    udata, tmp_filename, method=None, need_decompress_code=False, do_swap=None,
+    load_addr=None):
   """Compresses !! write docstring
 
   Tested and works with UPX 3.94.
@@ -589,7 +646,8 @@ def upx_compress32(udata, tmp_filename, method=None, need_decompress_code=False,
   if not isinstance(udata, (str, buffer)):
     raise TypeError
   method = get_upx_method_flags(method)
-  assert '--lzma' in method or '--no-lzma' in method
+  if not ('--lzma' in method or '--no-lzma' in method):
+    raise AssertionError
   method[:] = [arg for arg in method if arg != '--small']
   if '--none' in method:
     return upx_make_uncompressed(udata)
@@ -598,6 +656,16 @@ def upx_compress32(udata, tmp_filename, method=None, need_decompress_code=False,
     # It also makes the M_NRV2A_LE16 a few dozen bytes smaller (avoiding NOPs etc),
     # so we apply it.
     method.append('--small')
+  if do_swap is None:
+    # do_swap=True is better, because it produces empty padding in the
+    # result (result_ch.ubufsize == len(result_ch.compressed_data)).
+    #
+    # Unfortunately do_swap=True makes UPX 3.94 skip using filters and
+    # produce bad (suboptimal) compression ratio, so we can use it here only
+    # if --no-filter and --bad-ratio-ok are specified.
+    do_swap = '--no-filter' in method and '--bad-ratio-ok' in method
+  else:
+    do_swap = bool(do_swap)
 
   # Some golden values:
   #
@@ -609,15 +677,26 @@ def upx_compress32(udata, tmp_filename, method=None, need_decompress_code=False,
   #   Compression: method=M_LZMA filter=0
   #
 
-  # Since we are using padding_size=True, there is no need to avoid the UPX
-  # error: ': file is too small' by adding padding (for
-  # Packer::checkDefaultCompressionRatio), which is OK with at least 4096
-  # bytes or 6.25% gain.
-  elf32_size, elf32_header, udata2 = run_upx_elf32(
-      udata, tmp_filename, method, padding_size=True, do_swap=do_swap)
-  if elf32_size is False and len(udata) <= 0x2000:  # ': NotCompressibleException'.
-    # We've specified padding_size=True, this should have taken care of it.
-    raise RuntimeError('NotCompressibleException not expected.')
+  elf32_size, elf32_header, padding_data = False, None, None
+  if (not do_swap and '--ultra-brute' in method or '--brute' in method and
+      len(udata) > 1900):
+    # Try with a small padding first, it can save a few bytes (e.g. 4) if
+    # we end up adding less padding.
+    padding=max(4096 - len(udata) - 0x54, 0)
+    elf32_size, elf32_header, padding_data = run_upx_elf32(
+        udata, tmp_filename, method, padding=padding, load_addr=load_addr)
+  if elf32_size is False:  # ': NotCompressibleException' or first run.
+    # Since we are using padding=bool(...), there is no need to avoid the UPX
+    # error: ': file is too small' by adding padding (for
+    # Packer::checkDefaultCompressionRatio), which is OK with at least 4096
+    # bytes or 6.25% gain.
+    padding=bool(do_swap)
+    elf32_size, elf32_header, padding_data = run_upx_elf32(
+        udata, tmp_filename, method, padding=padding, load_addr=load_addr)
+    # ': NotCompressibleException'.
+    if elf32_size is False and len(udata) <= 0x2000:
+      # We've specified padding=bool(...), this should have taken care of it.
+      raise RuntimeError('NotCompressibleException not expected.')
   if not elf32_size:  # ': NotCompressibleException' or ': file is too large'.
     return upx_make_uncompressed(udata)
 
@@ -630,7 +709,7 @@ def upx_compress32(udata, tmp_filename, method=None, need_decompress_code=False,
   #      stub_i386_linux_elf_entry, sizeof(stub_i386_linux_elf_entry),
   #      tmp,                       sizeof(stub_i386_linux_elf_fold),  ft );
   # * len(udata)
-  # * len(udata2) (autogenerated because of padding_size=True)
+  # * len(padding_data)  (Combined with the previous block if do_swap=False).
 
   def get_ph_method(data):
     if len(data) < 36:
@@ -651,12 +730,12 @@ def upx_compress32(udata, tmp_filename, method=None, need_decompress_code=False,
     #
     # Example input (no flags): tiny7zx.unc
     #
-    # TODO(pts): Dynamically replace the decompressor with a smaller one
-    # instead of calling UPX again (which can be slow).
+    # !!! Call upx on a smaller data (and same filter?). addFilter32 doesn't
+    #     depend on --small, so we could reuse the same filter.
     method[:] = [flag for flag in method if flag != '--lzma']
     method.extend(('--small', '--no-lzma'))
-    elf32_size, elf32_header, udata2 = run_upx_elf32(
-        udata, tmp_filename, method, padding_size=True, do_swap=do_swap)
+    elf32_size, elf32_header, padding_data = run_upx_elf32(
+        udata, tmp_filename, method, padding=padding, load_addr=load_addr)
     data = open(tmp_filename, 'rb').read()
     if get_ph_method(data) == 14:
       raise ValueError('LZMA not expected.')
@@ -770,7 +849,7 @@ def upx_compress32(udata, tmp_filename, method=None, need_decompress_code=False,
   if p_info['p_blocksize'] != elf32_size:
     raise ValueError
 
-  data_b_info = None
+  last_b_info = data_b_info = padding_b_info = None
   c_adler32 = 1  # zlib.adler32('').
   compressed_elf32_header = None
   # There are 3 compressed blocks here:
@@ -778,7 +857,7 @@ def upx_compress32(udata, tmp_filename, method=None, need_decompress_code=False,
   # * 0x74 bytes: The compressed ELF32 header.
   # * The compressed padding.
   # * Our compressed udata.
-  for _ in xrange(3):
+  for _ in xrange(2 + bool(do_swap)):
     # Lots of filters (b_ftid) in filteri.cpp .
     # Packer::getDecompressorSections (contains NRV and LZMA)
     # Method can be (for elf32):
@@ -826,24 +905,36 @@ def upx_compress32(udata, tmp_filename, method=None, need_decompress_code=False,
         ('b_cto8', 'B'),  # Filter parameter.
         ('b_unused', 'B'),
     )
-    b_info = parse_struct(b_info_fields, data[i : i + 12])
+    last_b_info = parse_struct(b_info_fields, data[i : i + 12])
     dump_struct(b_info_fields, data[i : i + 12])
     i += 12
-    b_info['c_ofs'] = i  # Compressed data starts here.
-    b_cpr = buffer(data, i, b_info['sz_cpr'])
+    last_b_info['c_ofs'] = i  # Compressed data starts here.
+    last_b_cpr = buffer(data, i, last_b_info['sz_cpr'])
     if compressed_elf32_header is None:
-      compressed_elf32_header = b_cpr
-    elif data_b_info is None or do_swap:  # The compressed udata.
-      data_b_info = b_info
-    c_adler32 = zlib.adler32(b_cpr, c_adler32)
-    i += b_info['sz_cpr']
+      compressed_elf32_header = last_b_cpr
+    elif padding_b_info is None:
+      padding_b_info = last_b_info
+    else:
+      data_b_info = last_b_info
+    c_adler32 = zlib.adler32(last_b_cpr, c_adler32)
+    i += last_b_info['sz_cpr']
   c_adler32 &= 0xffffffff
-  if data_b_info['sz_unc'] != len(udata):
-    raise ValueError
-  #if data_b_info['sz_cpr'] >= len(udata):
-  #  raise ValueError('Compression not effective, UPX should have failed already.')
+  if do_swap:
+    if data_b_info is None:
+      raise AssertionError
+    if data_b_info['sz_unc'] != len(udata):
+      raise ValueError
+    if padding_b_info['sz_unc'] != len(padding_data):
+      raise ValueError
+    if padding_b_info['sz_cpr'] > 0xff:
+      raise ValueError('Padding is not compressible enough.')
+  else:
+    if padding_b_info is None or data_b_info is not None:
+      raise AssertionError
+    padding_b_info, data_b_info = None, padding_b_info
+    if data_b_info['sz_unc'] != len(udata) + len(padding_data):
+      raise ValueError
   compressed_data = buffer(data, data_b_info['c_ofs'], data_b_info['sz_cpr'])
-  #assert 0, [str(compressed_data)]
 
   # See funpad4(fi) in PackLinuxElf32::unpack.
   i += (-i & 0x3)  # Round up to 4 bytes.
@@ -882,7 +973,8 @@ def upx_compress32(udata, tmp_filename, method=None, need_decompress_code=False,
     # This is the jump to the real decompress routine.
     raise ValueError('Bad decompress start byte.')
   i += l_info['l_lsize'] - 8 - before_loader_pad
-  assert i == after_loader_ofs
+  if i != after_loader_ofs:
+    raise AssertionError
   i += 12
   # None of these checksums seems to match, we don't care, because UPX
   # doesn't care either when decompressing.
@@ -928,23 +1020,17 @@ def upx_compress32(udata, tmp_filename, method=None, need_decompress_code=False,
   #if ph['ph_level'] != ...:  # Not stored anywhere else.
   #  raise ValueError
   if do_swap:
-    u_adler32 = zlib.adler32(udata, zlib.adler32(udata2, zlib.adler32(elf32_header))) & 0xffffffff
+    u_adler32 = zlib.adler32(udata, zlib.adler32(padding_data, zlib.adler32(elf32_header))) & 0xffffffff
   else:
-    u_adler32 = zlib.adler32(udata2, zlib.adler32(udata, zlib.adler32(elf32_header))) & 0xffffffff
+    u_adler32 = zlib.adler32(padding_data, zlib.adler32(udata, zlib.adler32(elf32_header))) & 0xffffffff
   if ph['ph_u_adler'] != u_adler32:
     raise ValueError
   if ph['ph_c_adler'] != c_adler32:
     raise ValueError
-  if do_swap:
-    if ph['ph_u_len'] != len(udata):  # Only the last block.
-      raise ValueError
-    if ph['ph_c_len'] != data_b_info['sz_cpr']:  # Only the last block.
-      raise ValueError
-  else:
-    if ph['ph_u_len'] != len(udata2):  # Only the last block.
-      raise ValueError
-    if ph['ph_c_len'] != b_info['sz_cpr']:  # Only the last block.
-      raise ValueError
+  if ph['ph_u_len'] != last_b_info['sz_unc']:  # Only the last block.
+    raise ValueError
+  if ph['ph_c_len'] != last_b_info['sz_cpr']:  # Only the last block.
+    raise ValueError
   if ph['ph_u_file_size'] != elf32_size:
     raise ValueError
   if ph['ph_filter'] != data_b_info['b_ftid']:
@@ -955,6 +1041,8 @@ def upx_compress32(udata, tmp_filename, method=None, need_decompress_code=False,
   #  raise ValueError
   #os.unlink(tmp_filename)
   # !! Check the ph_checksum.
+  if len(compressed_data) >= len(udata):
+    return upx_make_uncompressed(udata)
 
   i = data.find('\n\0$Info: This file is packed with the UPX executable packer http://upx.sf.net $\n\0$Id: UPX ', loader_ofs)  # identbig.
   if i < 0:
@@ -968,8 +1056,10 @@ def upx_compress32(udata, tmp_filename, method=None, need_decompress_code=False,
   # compressed FOLDEXEC (stub_i386_linux_elf_fold), which is <1630 bytes
   # (less because of compression).
   loader_end_ofs = i
-  #if data_b_info['sz_cpr'] + (loader_end_ofs - loader_ofs) >= len(udata):
-  #  raise ValueError('Compression not effective, UPX should have failed already.')
+  if (need_decompress_code and
+      len(compressed_data) + (loader_end_ofs - loader_ofs) >=
+      len(udata) + 0x10):
+    return upx_make_uncompressed(udata)
   if data_b_info['b_ftid'] != 0:
     decompress_ofs = lexec000_ofs + 7 + ord(data[lexec000_ofs + 6])
     decompress_code = data[decompress_ofs : loader_end_ofs]
@@ -996,36 +1086,46 @@ def upx_compress32(udata, tmp_filename, method=None, need_decompress_code=False,
       filter=data_b_info['b_ftid'],
       filter_cto=filter_cto,
       compressed_data=str(compressed_data),
-      ubufsize=len(udata),  # Formerly: + padding_size,
+      ubufsize=data_b_info['sz_unc'],
       decompress_code=decompress_code,
       unfilter_code=unfilter_code,
-      # Unfortunately we need to pass it for LZMA, because we don't have an
-      # alternative compressor easily available.
-      #
-      # !! Make UPX (run_upx_elf32) compress ELF with 2 PT_LOAD sections,
-      #    one of them being large, the other one being arbitrary, and
-      #    containing the ELF header. This makes the other idea
-      #    (`xz --format=raw') unnecessary.
-      compressed_elf32_header=str(compressed_elf32_header) * bool(data_b_info['b_method'] == 14))
+      # Unused by default, will be used only with
+      # compress_upxz(..., do_add_compressed_elf32_header=False).
+      compressed_elf32_header=str(compressed_elf32_header))
+
+
+# Hardcoded, so .upxz files remain decompressible in the future.
+UPXZ_LOAD_ADDR = 0x101000
 
 
 def compress_upxz(udata, tmp_filename, method=None, ch=None,
-                  is_uncompressed_ok=True, do_check_decompress=False):
+                  is_uncompressed_ok=True, do_check_decompress=False,
+                  do_add_compressed_elf32_header=False):
   if ch is None:
-    ch = upx_compress32(udata, tmp_filename, method)
+    ch = upx_compress32(udata, tmp_filename, method, load_addr=UPXZ_LOAD_ADDR)
+  if not do_add_compressed_elf32_header and ch.method in (0, 2, 5, 8, 14):
+    # For these methods the decompressor (build_elf32_for_upx_decompression
+    # called from decompress_upxz) can build the compressed_elf32_header
+    # from scratch (and ch.ubufsize), so we don't have to store it.
+    #
+    # We typically save about 50 bytes for LZMA, and a bit more (up to 83
+    # bytes) for other methods.
+    compressed_elf32_header = ''
+  else:
+    compressed_elf32_header = ch.compressed_elf32_header
   if (ch.method != 0 and is_uncompressed_ok and
-      28 + len(ch.compressed_data) + len(ch.compressed_elf32_header) >=
+      28 + len(ch.compressed_data) + len(compressed_elf32_header) >=
       32 + len(udata)):
     # Store it uncompressed, it's smaller that way.
     ch = upx_make_uncompressed(udata)
   upxz_header = struct.pack(
       '<4sLLBBBBLLHH', 'UPXZ', len(udata), len(ch.compressed_data),
-      ch.method, ch.filter, ch.filter_cto, len(ch.compressed_elf32_header),
+      ch.method, ch.filter, ch.filter_cto, len(compressed_elf32_header),
       zlib.adler32(udata) & 0xffffffff,
       zlib.adler32(ch.compressed_data) & 0xffffffff,
       ch.ubufsize - len(udata), 0)
   upxz_data = ''.join((
-      upxz_header, ch.compressed_data, ch.compressed_elf32_header))
+      upxz_header, ch.compressed_data, compressed_elf32_header))
   if do_check_decompress:
     udata2 = decompress_upxz(upxz_data, tmp_filename)
     if buffer(udata2) != buffer(udata):
@@ -1061,9 +1161,10 @@ def decompress_upxz(upxz_data, tmp_filename):
       compressed_elf32_header=compressed_elf32_header)
   elf32_data = build_elf32_for_upx_decompression(
       ch=ch,
-      compressed_elf32_header=compressed_elf32_header,
+      tmp_filename=tmp_filename,
       udata_size=udata_size,
-      udata_adler32=udata_adler32)
+      udata_adler32=udata_adler32,
+      load_addr=UPXZ_LOAD_ADDR)
   open(tmp_filename, 'wb').write(elf32_data)
   del elf32_data  # Save memory.
 
@@ -1144,7 +1245,8 @@ def get_smart_decompress_code(ch, udata=None):
   if ch.method == 0:  # Shortcut based on smart_decompress_none.nasm .
     # Total overhead: 23 bytes, including ubufsize_internal (4 bytes).
     code = [format0_code]
-    assert len(code[0]) + 4 == FORMAT0_SMART_DECOMPRESS_CODE_SIZE
+    if len(code[0]) + 4 != FORMAT0_SMART_DECOMPRESS_CODE_SIZE:
+      raise AssertionError
   elif ch.filter != 0:  # Based on smart_decompress_filter.nasm .
     # !! TODO(pts): Is unfilter_code = ch.unfilter_code.lstrip('\x90') safe here?
     # .rstrip('\0') isn't safe, because it ruins the relative offsets of the
@@ -1224,66 +1326,31 @@ def compress_c32(udata, tmp_filename, method=None):
   return compress_flat32(udata, tmp_filename, method, prefix_size=5)
 
 
-def get_elftiny32_size(text_data_size, load_addr):
-  return 0x54 + ((load_addr - 0x54) & 0xfff) + text_data_size
-
-
-def build_elftiny32(text_data, load_addr, entry_addr, end_addr, extra_phdrs, e_osabi=3):
-  if not isinstance(text_data, (str, buffer)):
+def get_strip_elf32_size(udata):
+  if not isinstance(udata, (str, buffer)):
     raise TypeError
-  if not isinstance(extra_phdrs, (str, buffer)):
-    raise TypeError
-  if load_addr <= 0:
+  udata = buffer(udata)
+  if len(udata) < 0x54:
     raise ValueError
-  if end_addr - load_addr < len(text_data):
+  ehdr = parse_struct(EHDR_FIELDS, buffer(udata, 0, 0x34))
+  #dump_struct(EHDR_FIELDS, buffer(udata, 0, 0x34))
+  elf32_header_size = ehdr['e_phoff'] + 0x20 * ehdr['e_phnum']
+  if len(udata) < elf32_header_size:
     raise ValueError
-  if not (load_addr <= entry_addr < end_addr):
-    raise ValueError
-  if (len(extra_phdrs) & 0x1f) != 0:
-    raise ValueError
-
-  elf32_header_size = 0x54 + len(extra_phdrs)
-  # Make room for the ELF32 header at the beginning of the first page.
-  prefix = '\0' * ((load_addr - elf32_header_size) & 0xfff)
-  #assert 0, 'prefix_size=0x%x' % len(prefix)
-  vaddr = load_addr - len(prefix) - elf32_header_size
-  assert (vaddr & 0xfff) == 0  # Aligned to page boundary.
-  fields = (
-      ('ei_mag', '4s', '\x7fELF'),
-      ('ei_class', 'B', 1),
-      ('ei_data', 'B', 1),
-      ('ei_version', 'B', 1),
-      ('e_osabi', 'B', e_osabi),
-      ('e_abiversion', 'B', 0),
-      ('e_pad', '7s', '\0\0\0\0\0\0\0'),
-      ('e_type', 'H', 2),
-      ('e_machine', 'H', 3),
-      ('e_version', 'L', 1),
-      ('e_entry', 'L', entry_addr),
-      ('e_phoff', 'L', 0x34),
-      ('e_shoff', 'L', 0),
-      ('e_flags', 'L', 0),
-      ('e_ehsize', 'H', 0x34),
-      ('e_phentsize', 'H', 0x20),
-      ('e_phnum', 'H', 1 + (len(extra_phdrs) >> 5)),
-      ('e_shentsize', 'H', 0),  # pts-xtiny has 0; 0x28 also works.
-      ('e_shnum', 'H', 0),
-      ('e_shstrndx', 'H', 0),
-      ('p_type', 'L', 1),
-      ('p_offset', 'L', 0),
-      ('p_vaddr', 'L', vaddr),
-      ('p_paddr', 'L', vaddr),
-      ('p_filesz', 'L', load_addr + len(text_data) - vaddr),
-      ('p_memsz', 'L', end_addr - vaddr),
-      ('p_flags', 'L', 7),
-      ('p_align', 'L', 0x1000),  # pts-xtiny has 0x1000; 1 also works.
-      ('extra_phdrs', '.str', extra_phdrs),
-      ('prefix', '.str', prefix),
-      ('text_data', '.str', text_data),
-  )
-  result = pack_fields(fields)
-  assert len(result) == get_elftiny32_size(len(text_data), load_addr)
-  return result
+  keep_size = elf32_header_size
+  for phi in xrange(ehdr['e_phnum']):
+    i = ehdr['e_phoff'] + 0x20 * phi
+    phdrb = buffer(udata, i, 0x20)
+    phdr = parse_struct(PHDR_FIELDS, phdrb)
+    #dump_struct(PHDR_FIELDS, phdrb)
+    j = phdr['p_offset']
+    k = k0 = j + phdr['p_filesz']
+    j = min(j, elf32_header_size)
+    # Remove trailing '\0' from segment.
+    while j < k and udata[k - 1] == '\0':
+      k -= 1
+    keep_size = max(keep_size, k)
+  return keep_size
 
 
 def strip_elf32(udata):
@@ -1388,10 +1455,77 @@ def strip_elf32(udata):
 
   # Keep only the first keep_size bytes.
   print 'keep_size=0x%x' % keep_size
+  # True but slow:
+  # if keep_size != get_strip_elf32_size(udata):
+  #   raise AssertionError
   if buffer(udatahd) == buffer(udata, 0, elf32_header_size):
     return udata[:keep_size]
   else:
     return udatahd + udata[elf32_header_size : keep_size]
+
+
+def get_elftiny32_size(text_data_size, load_addr):
+  return 0x54 + ((load_addr - 0x54) & 0xfff) + text_data_size
+
+
+def build_elftiny32(text_data, load_addr, entry_addr, end_addr, extra_phdrs, e_osabi=3):
+  if not isinstance(text_data, (str, buffer)):
+    raise TypeError
+  if not isinstance(extra_phdrs, (str, buffer)):
+    raise TypeError
+  if load_addr <= 0:
+    raise ValueError
+  if end_addr - load_addr < len(text_data):
+    raise ValueError
+  if not (load_addr <= entry_addr < end_addr):
+    raise ValueError
+  if (len(extra_phdrs) & 0x1f) != 0:
+    raise ValueError
+
+  elf32_header_size = 0x54 + len(extra_phdrs)
+  # Make room for the ELF32 header at the beginning of the first page.
+  prefix = '\0' * ((load_addr - elf32_header_size) & 0xfff)
+  #assert 0, 'prefix_size=0x%x' % len(prefix)
+  vaddr = load_addr - len(prefix) - elf32_header_size
+  if (vaddr & 0xfff) != 0:  # Aligned to page boundary.
+    raise AssertionError
+  fields = (
+      ('ei_mag', '4s', '\x7fELF'),
+      ('ei_class', 'B', 1),
+      ('ei_data', 'B', 1),
+      ('ei_version', 'B', 1),
+      ('e_osabi', 'B', e_osabi),
+      ('e_abiversion', 'B', 0),
+      ('e_pad', '7s', '\0\0\0\0\0\0\0'),
+      ('e_type', 'H', 2),
+      ('e_machine', 'H', 3),
+      ('e_version', 'L', 1),
+      ('e_entry', 'L', entry_addr),
+      ('e_phoff', 'L', 0x34),
+      ('e_shoff', 'L', 0),
+      ('e_flags', 'L', 0),
+      ('e_ehsize', 'H', 0x34),
+      ('e_phentsize', 'H', 0x20),
+      ('e_phnum', 'H', 1 + (len(extra_phdrs) >> 5)),
+      ('e_shentsize', 'H', 0),  # pts-xtiny has 0; 0x28 also works.
+      ('e_shnum', 'H', 0),
+      ('e_shstrndx', 'H', 0),
+      ('p_type', 'L', 1),
+      ('p_offset', 'L', 0),
+      ('p_vaddr', 'L', vaddr),
+      ('p_paddr', 'L', vaddr),
+      ('p_filesz', 'L', load_addr + len(text_data) - vaddr),
+      ('p_memsz', 'L', end_addr - vaddr),
+      ('p_flags', 'L', 7),
+      ('p_align', 'L', 0x1000),  # pts-xtiny has 0x1000; 1 also works.
+      ('extra_phdrs', '.str', extra_phdrs),
+      ('prefix', '.str', prefix),
+      ('text_data', '.str', text_data),
+  )
+  result = pack_fields(fields)
+  if len(result) != get_elftiny32_size(len(text_data), load_addr):
+    raise AssertionError('Bad output size of build_elftiny32.')
+  return result
 
 
 def compress_elftiny32(udata, tmp_filename, method=None):
@@ -1522,7 +1656,8 @@ def compress_elftiny32(udata, tmp_filename, method=None):
     for phi in xrange(1, ehdr['e_phnum']):
       print 'Subsequent ELF header %d:' % phi
       phdrst = buffer(udata, 0x34 + phi * 0x20, 0x20)
-      assert len(phdrst) == 0x20
+      if len(phdrst) != 0x20:
+        raise AssertionError  # Already checked above.
       phdri = parse_struct(PHDR_FIELDS, phdrst)
       dump_struct(PHDR_FIELDS, phdrst)
       if phdri['p_type'] in (2, 3, 6):  # PT_DYNAMIC, PT_INTERP, PT_PHDR.
@@ -1579,7 +1714,8 @@ def compress_elftiny32(udata, tmp_filename, method=None):
   load_addr = phdr['p_vaddr'] + elf32_header_size + j
   entry_addr = ehdr['e_entry']
   end_addr = phdr['p_vaddr'] + last_memsz
-  assert end_addr - load_addr >= len(text_data)  # Follows from above.
+  if end_addr - load_addr < len(text_data):
+    raise AssertionError  # Follows from above.
   # This would create an identical output file for pts-xtiny, but for glibc
   # it would add a gap page between th r-x and the r-w segments.
   # return build_elftiny32(
@@ -1592,9 +1728,6 @@ def compress_elftiny32(udata, tmp_filename, method=None):
 
   ch = upx_compress32(
       text_data, tmp_filename, method, need_decompress_code=True)
-  # !! Do real elfstrip.
-  elfstrip_elf32_size = get_elftiny32_size(len(text_data), load_addr)
-  # !! Try with -Wl,-N and without.
   if ch.method != 0:
     # !! TODO(pts): Look at LEXEC010 in stub/src/i386-linux.elf-entry.S,
     #    remove some stack push ops, saving 20..100 bytes of code size.
@@ -1612,8 +1745,9 @@ def compress_elftiny32(udata, tmp_filename, method=None):
     cp_load_addr = ((orig_load_addr - cp_text_data_size - cp_elf32_header_size)
                      & ~0xfff) + cp_elf32_header_size
     cp_elftiny32_size = get_elftiny32_size(cp_text_data_size, cp_load_addr)
-    assert cp_elftiny32_size == cp_elf32_header_size + cp_text_data_size
-    if cp_elftiny32_size < elfstrip_elf32_size:
+    if cp_elftiny32_size != cp_elf32_header_size + cp_text_data_size:
+      raise AssertionError
+    if cp_elftiny32_size < get_strip_elf32_size(udata):
       if ch.filter != 0:  # Based on smart_decompress_elftiny_filter.disasm .
         cp_text_data = ''.join((
              '\x6a', struct.pack('<B', ch.filter_cto),
@@ -1636,14 +1770,13 @@ def compress_elftiny32(udata, tmp_filename, method=None):
             '\xe9', struct.pack('<L', entry_addr - (cp_load_addr + 0x2a)),
             'UPX~',
              ch.decompress_code, ch.compressed_data))
-      assert len(cp_text_data) == cp_text_data_size
+      if len(cp_text_data) != cp_text_data_size:
+        raise AssertionError
       return build_elftiny32(
           cp_text_data, cp_load_addr, cp_load_addr,
           max(end_addr, load_addr + ch.ubufsize),
           extra_phdrs, e_osabi)
-  # !! Do real elfstrip.
-  return build_elftiny32(
-      text_data, load_addr, entry_addr, end_addr, extra_phdrs, e_osabi)
+  return strip_elf32(udata)  # Can't make it smaller, just strip it.
 
 
 # !! upx-3.92 and upx-3.94 don't report AlreadyPackedException with -q; they just don't create the output file.
@@ -1774,6 +1907,7 @@ def detect_input_format(udata, input_format):
 
 def main(argv):
   input_file = None
+  # Can be the same as input_file, everything is read to memory.
   output_file = None
   do_decompress = False
   method_flags = []
@@ -1788,6 +1922,7 @@ def main(argv):
     sys.exit(0)
     # TODO(pts): Document command-line flags.
 
+  # !! Add -f flag to overwrite files, like upx does. (?)
   i = 1
   while i < len(argv):
     arg = argv[i]
@@ -1800,8 +1935,11 @@ def main(argv):
     arg = '--' + arg.lstrip('-')
     if len(arg) == 3 and arg[2] in '123456789':
       method_flags.append(arg[1:])
+    elif arg in ('--none', '--bad-ratio-ok'):
+      # Only supported by upxbc, not UPX.
+      method_flags.append(arg)
     elif arg in ('--best', '--brute', '--ultra-brute', '--lzma', '--no-lzma',
-                 '--nrv2b', '--nrv2d', '--nrv2e', '--small', '--none',
+                 '--nrv2b', '--nrv2d', '--nrv2e', '--small',
                  '--no-filter', '--all-filters', '--all-methods'):
       method_flags.append(arg)
     elif arg in ('--q', '--qq', '--qqq'):
