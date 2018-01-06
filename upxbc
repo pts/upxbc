@@ -552,7 +552,7 @@ def get_upx_method_flags(method):
     raise ValueError(
         'Multiple method flags specified: %s' % ' '.join(sorted(method_flags)))
   if method_flags and ('--brute' in method or '--ultra-brute' in method):
-    raise ValueError('Method flags not compatible with --*brute: ' %
+    raise ValueError('Method flags not compatible with --*brute: %s' %
                      ' '.join(sorted(method_flags)))
   if '--none' in method:
     method[:] = [flag for flag in method if flag not in (
@@ -1674,7 +1674,7 @@ def compress_elftiny32(udata, tmp_filename, method=None):
   ehdr = parse_struct(EHDR_FIELDS, buffer(udata, 0, 0x34))
   dump_struct(EHDR_FIELDS, buffer(udata, 0, 0x34))
 
-  # This accepts a Linux i386 ELF executable created by pts-xtiny.
+  # !! If already compressed by UPX, decompress first.
 
   if ehdr['ei_mag'] != '\x7fELF':
     raise ValueError
@@ -1774,6 +1774,8 @@ def compress_elftiny32(udata, tmp_filename, method=None):
         pass
       elif phdri['p_type'] != 1:  # Just include it unmodified.
         extra_phdrs.append(phdrst)
+      elif phdri['p_filesz'] == 0 and phdri['p_memsz'] == 0:
+        pass  # Happens to programs already compressed by UPX.
       else:  # PT_LOAD.
         if (phdri['p_flags'] & ~7) != 0:  # Standardize to 7.
           raise ValueError
