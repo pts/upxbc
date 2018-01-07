@@ -1,6 +1,11 @@
 ;
+; smart_decompress_elftiny.nasm: position-dependent Linux i386 ELF decompressor entry point without filter
 ; by pts@fazekas.hu at Fri Jan  5 21:00:25 CET 2018
+;
 ; $ nasm -f bin -o smart_decompress_elftiny.bin smart_decompress_elftiny.nasm && ndisasm -b 32 smart_decompress_elftiny.bin >smart_decompress_elftiny.disasm
+;
+; This code is not used by upxbc. The portions used have been copied
+; over manually from *.disasm .
 ;
 
 bits 32

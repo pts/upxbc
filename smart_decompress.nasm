@@ -1,6 +1,11 @@
 ;
+; smart_decompress.nasm: position-independent ...
 ; by pts@fazekas.hu at Tue Jan  2 02:27:52 CET 2018
+;
 ; $ nasm -f bin -o smart_decompress_filter.bin smart_decompress_filter.nasm && ndisasm -b 32 smart_decompress_filter.bin >smart_decompress_filter.disasm
+;
+; This code is not used by upxbc. The portions used have been copied
+; over manually from *.disasm .
 ;
 
 bits 32

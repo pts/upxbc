@@ -1,7 +1,11 @@
+;
+; decompress_none.nasm: position-independent passthrough (copying) decompressor for the i386 with the Linux i386 ABI
 ; by pts@fazekas.hu at Wed Jan  3 01:18:03 CET 2018
 ;
-; Implementation of a position-independent passthrough (copying)
-; decompressor for the i386 with the Linux i386 ABI.
+; $ nasm -f bin -o decompress_none.bin decompress_none.nasm && ndisasm -b 16 decompress_none.bin >decompress_none.disasm
+;
+; This code is not used by upxbc. The portions used have been copied
+; over manually from *.disasm .
 ;
 ; Position-independent i386 machine code for the decompress function.
 ; Linux i386 ABI, see http://wiki.osdev.org/System_V_ABI

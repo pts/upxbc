@@ -10,10 +10,11 @@ Features:
 * Compressing Syslinux COM32R (.c32) executables.
 * Compressing and decompressing arbitrary binary data files to the UPXZ
   format (which is specific to upxbc).
-* Compressing arbitrary i386 flat executables in a position-independent way.
-  `flat' means that enough bytes are memory-mapped after the text segment,
-  and the text segment is read-write-execute, and the files don't need to
-  have a specific header.
+* (--flat32 and --flat16) Compressing arbitrary i386 32-bit and 16-bit flat
+  executables in a position-independent way. `flat' means that enough bytes
+  are memory-mapped after the text segment, and the text segment is
+  read-write-execute, and the files don't need to have a specific header.
+  This is usable for compressing bootloaders and memtest.
 * Compressing arbitrary i386 flat executables to GNU assembler .s source
   files, to be included in other programs.
 * (--elftiny) Compressing statically linked Linux i386 ELF executables with
@@ -39,9 +40,9 @@ Usage on Linux, macOS and other Unix systems:
   ...
   $ curl -O https://raw.githubusercontent.com/pts/upxbc/master/upxbc
   $ chmod 755 ./upxbc
-  $ ./upxbc INPUTFILE OUTPUTFILE
-  $ ./upxbc INPUTFILE.c32 OUTPUTFILE.c32
-  $ ./upxbc --elftiny INPUTPROG OUTPUTPROG
+  $ ./upxbc INPUTFILE
+  $ ./upxbc --elftiny INPUTPROG
+  $ ./upxbc -f -o OUTPUTFILE.c32 INPUTFILE.c32
 
 Why use upxbc instead vanilla UPX?
 
@@ -58,8 +59,12 @@ Why use upxbc instead vanilla UPX?
 * `upxbc --upxz' works as a general-purpose compressor, it only adds a
   minimal header (no decompressor) to the existing file.
 * `upxbc --c32' can compress Syslinux COM32R (.c32) executables.
-* `upxbc --prefix-size=...' can compress any i386 flat executable, even
+* `upxbc --flat32' can compress any i386 flat executable, even
   those without any header.
+* `upxbc --flat16' can compress any i386 16-bit flat executable, even
+  those without any header. (The flat16 signature needs to be present
+  in the exectuable, and there are some alignment requirements, see the
+  docstring of the compress_flat16 function.)
 * `upxbc --asm' can generate .s source files containing the compressed
   data and the i386 decompressor, which GCC and other tools can understand,
   so you can add compressed data to your program, and make it decompress
