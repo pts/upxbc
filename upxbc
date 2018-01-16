@@ -2137,8 +2137,8 @@ def compress_flat16(udata, tmp_filename, method=None, load_addr=None,
 
   for signature in (LONG_SIGNATURE1, LONG_SIGNATURE2, SHORT_SIGNATURE1):
     signature_ofs = udata.find(
-        signature, SIGNATURE_PHASE,
-        SIGNATURE_PHASE + signature_start_ofs_max + len(signature))
+        signature, 0,
+        SIGNATURE_PHASE + (signature_start_ofs_max or 0) + len(signature))
     if signature_ofs >= 0:
       mode = ('short', 'long')[len(signature) == len(LONG_SIGNATURE1)]
       break
@@ -2154,7 +2154,8 @@ def compress_flat16(udata, tmp_filename, method=None, load_addr=None,
 
   if (((load_addr or 0) + signature_ofs) & 0xf) != 0xc:
     raise ValueError(
-        'flat16 signature not aligned to 16-byte boundary + 12.')
+        'flat16 signature not aligned to 16-byte boundary + 12, but: %d' %
+        (((load_addr or 0) + signature_ofs) & 0xf))
   # http://wiki.osdev.org/Memory_Map_(x86)
   if load_addr is not None and load_addr < 0x500:
     raise ValueError('Code to be loaded too early in memory.')
@@ -2407,7 +2408,7 @@ def detect_input_format(udata, input_format):
   if input_format is None:
     return detected_format
   if input_format != detected_format and not (
-      input_format in ('binary', 'flat32') or
+      input_format in ('binary', 'flat16', 'flat32') or
       (input_format == 'elftiny32' and detected_format == 'elf')):
     raise ValueError('Input format mismatch: detected %s, asked %s' %
                      (detected_format, input_format))
@@ -2592,7 +2593,7 @@ def main(argv):
   elif input_format == output_format == 'flat16':
     data = compress_flat16(
         udata, tmp_filename, method=method, load_addr=load_addr,
-        signature_start_ofs_max=signature_start_ofs_max)
+        signature_start_ofs_max=(signature_start_ofs_max or 0))
   elif input_format == 'flat32' and output_format == 'asm':
     data = compress_flat32_to_asm(
         udata, tmp_filename, method=method, prefix_size=(prefix_size or 0))
