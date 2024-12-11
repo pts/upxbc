@@ -670,7 +670,7 @@ def parse_elf32_compressed_by_upx(
     raise ValueError
   if ehdr['ei_version'] != 1:
     raise ValueError
-  if ehdr['e_osabi'] not in (0, 3):  # 0: System V, 3: Linux.
+  if ehdr['e_osabi'] not in (0, 3, 9):  # 0: System V, 3: Linux, 9: FreeBSD.
     raise ValueError
   if ehdr['e_abiversion'] != 0:
     raise ValueError
@@ -1503,7 +1503,7 @@ def strip_elf32(udata):
   if ehdr['ei_version'] != 1:
     raise ValueError
   # Ignore e_osabi.
-  #if ehdr['e_osabi'] not in (0, 3):  # 0: System V, 3: Linux.
+  #if ehdr['e_osabi'] not in (0, 3, 9):  # 0: System V, 3: Linux, 9: FreeBSD.
   #  raise ValueError
   if ehdr['e_abiversion'] != 0:
     raise ValueError
@@ -1702,7 +1702,7 @@ def compress_elftiny32(udata, tmp_filename, method=None):
     raise ValueError
   if ehdr['ei_version'] != 1:
     raise ValueError
-  if ehdr['e_osabi'] not in (0, 3):  # 0: System V, 3: Linux.
+  if ehdr['e_osabi'] not in (0, 3, 9):  # 0: System V, 3: Linux, 9: FreeBSD.
     raise ValueError
   if ehdr['e_abiversion'] != 0:
     raise ValueError
