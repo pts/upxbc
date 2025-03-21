@@ -15,6 +15,23 @@ typically won't work (unless the hashlib module is installed from PyPi).
 Typical usage: upxbc -f -o output.c32 input.c32
 
 https://github.com/pts/upxbc
+
+About the System V i386 ABI and calling convention (cdecl):
+
+* If floating-point arguments are present, then the rules below don't apply.
+* Function arguments are passed on the stack: dword \[ESP\] is the return
+  address, dword \[EBP+4\] is argument 1, dword \[EBP+2*4\] is argument 2
+  etc.
+* The callee returns in register EAX or EDX:EAX (EDX is the high dword).
+* The callee is allowed to modify the on-stack copy of the arguments.
+* The caller cleans up the arguments from the stack after the call.
+* The callee is allowed to modify scratch registers EAX, EDX, ECX and
+  EFLAGS, and it must preserve all other registers.
+* See also: http://wiki.osdev.org/System_V_ABI
+* Doc: https://www.sco.com/developers/devspecs/abi386-4.pdf
+* Doc: https://www.uclibc.org/docs/psABI-i386.pdf
+
+!!! Make sure that specifying --lzma only disables all NRV. Make sure that both are enabled if --no-lzma is not specified.
 """
 
 import array
@@ -312,8 +329,10 @@ class UpxCompressed(object):
       # input data. Additional bytes will be filled with padding_char ('\0').
       'ubufsize',
       # Position-independent i386 machine code for the decompress function.
-      # Linux i386 ABI, see http://wiki.osdev.org/System_V_ABI
-      # C signature: int decompress(const char *inp, unsigned ins, char *outp, unsigned *ubufsizep) __attribute__((regparm(0)));
+      # cdecl calling convention (https://en.wikipedia.org/wiki/X86_calling_conventions#cdecl).
+      # System V i386 ABI calling convention.
+      # GCC C signature: int decompress(const char *inp, unsigned ins, char *outp, unsigned *ubufsizep) __attribute__((regparm(0)));
+      # Watcom C signature: int __cdecl decompress(const char *inp, unsigned ins, char *outp, unsigned *ubufsizep);
       # Call decompress before unfilter.
       # You need to know the uncompressed size first, put it to *ubufsizep.
       # decompress will modify *ubufsizep, but eventually it will set it back to its
@@ -324,8 +343,10 @@ class UpxCompressed(object):
       # Returns 0 on success.
       'decompress_code',
       # Position-independent i386 machine code for the unfilter (lxunfilter) function.
-      # Linux i386 ABI, see http://wiki.osdev.org/System_V_ABI
-      # C signature: void unfilter(char *outp, unsigned ubufsize, unsigned filter_cto) __attribute__((regparm(0)));
+      # cdecl calling convention (https://en.wikipedia.org/wiki/X86_calling_conventions#cdecl).
+      # System V i386 ABI calling convention.
+      # GCC signature: void unfilter(char *outp, unsigned ubufsize, unsigned filter_cto) __attribute__((regparm(0)));
+      # Watcom C signature: void __cdecl unfilter(char *outp, unsigned ubufsize, unsigned filter_cto);
       # Call decompress before unfilter.
       # No need to call unfilter if filter is 0.
       # You need to know the uncompressed size first, put it to ubufsize.
@@ -494,14 +515,14 @@ def build_elf32_for_upx_decompression(
       ('sz0_cpr', 'L', len(compressed_elf32_header)),
       ('b0_method', 'B', ch.method),
       ('b0_ftid', 'B', 0),
-      ('b0_cto8', 'B', 0),
+      ('b0_cto8', 'B', 0),  # filter_cto.
       ('b0_unused', 'B', 0),
       ('b0_cpr', '.str', compressed_elf32_header),
       ('sz1_unc', 'L', ch.ubufsize),
       ('sz1_cpr', 'L', len(ch.compressed_data)),
       ('b1_method', 'B', ch.method),
       ('b1_ftid', 'B', ch.filter),
-      ('b1_cto8', 'B', ch.filter_cto),
+      ('b1_cto8', 'B', ch.filter_cto),  # filter_cto.
       ('b1_unused', 'B', 0),
       ('b1_cpr', '.str', ch.compressed_data),
       ('ld_pad4', '.pad', 4),
@@ -827,7 +848,7 @@ def parse_elf32_compressed_by_upx(
         ('sz_cpr', 'L'),  # Compressed size.
         ('b_method', 'B'),  # Compression algorithm.
         ('b_ftid', 'B'),  # Filter ID.
-        ('b_cto8', 'B'),  # Filter parameter.
+        ('b_cto8', 'B'),  # Filter parameter. filter_cto.
         ('b_unused', 'B'),
     )
     last_b_info = parse_struct(b_info_fields, data[i : i + 12])
@@ -969,7 +990,7 @@ def parse_elf32_compressed_by_upx(
     raise ValueError
   if ph['ph_filter'] != data_b_info['b_ftid']:
     raise ValueError
-  if ph['ph_filter_cto'] != data_b_info['b_cto8']:
+  if ph['ph_filter_cto'] != data_b_info['b_cto8']:  # filter_cto.
     raise ValueError
   #if ph['ph_n_mru1'] != ...:  # Not stored anywhere else.
   #  raise ValueError
@@ -1004,7 +1025,7 @@ def parse_elf32_compressed_by_upx(
       decompress_code = data[decompress_ofs : loader_end_ofs]
     if unfilter_code is None:
       unfilter_code = data[lexec000_ofs + 7 : decompress_ofs]
-    filter_cto = data_b_info['b_cto8']
+    filter_cto = data_b_info['b_cto8']  # filter_cto.
   else:
     if decompress_code is None:
       decompress_code = data[lexec000_ofs + 5 : loader_end_ofs]
@@ -1027,8 +1048,8 @@ def parse_elf32_compressed_by_upx(
       filter_cto=filter_cto,
       compressed_data=str(compressed_data),
       ubufsize=data_b_info['sz_unc'],
-      decompress_code=str(decompress_code),
-      unfilter_code=unfilter_code,
+      decompress_code=str(decompress_code),  # 2833 bytes (UPX 3.94) for LZMA, about 184 bytes for NRV.
+      unfilter_code=unfilter_code,  # Either missing, or about 64 bytes. !! TODO(pts): Undo the jump: (lxunfilter, decompress, lxunfilter_low) --> (decompress, combined lxunfilter).
       # Unused by default, will be used only with
       # compress_upxz(..., do_add_compressed_elf32_header=False).
       compressed_elf32_header=str(compressed_elf32_header))
@@ -1096,22 +1117,46 @@ def get_decompress_code(ph_method, ph_filter, tmp_filename2):
 def upx_compress32(
     udata, tmp_filename, method=None, need_decompress_code=False, do_swap=None,
     load_addr=None):
-  """Compresses !! write docstring
+  """Compresses data by running UPX on a fake Linux i386 executable.
 
   Tested and works with UPX 3.94.
-
-  The corresponding decompression is not implemented.
-  !! Write a Linux i386 ELF file and run it on Linux.
-     Alterantively, save the settings (ph_method, ph_filter, ph_filter_cto),
-     and also 4 bytes of adler32 checksum to the file, and pass it to upx -d.
-
-  !! doc: --no-filter, --all-filters, --all-methods
 
   The compressed output may be longer than the input (udata), the caller has
   to decide how to use or discard it.
 
+  The corresponding decompression is not implemented.
+
+  The compression parameters are not stored in the result: ph_filter_cto is
+  stored, but ph_method and ph_filter aren't.
+
+  !! To decompress, write a Linux i386 ELF file and run it on Linux.
+     Alterantively (system-independent), save the settings (ph_method,
+     ph_filter, ph_filter_cto), and also 4 bytes of adler32 checksum to the
+     file, and pass it to upx -d.
+
+  !! doc: --no-filter, --all-filters, --all-methods
+
+  Args:
+    udata: An str or buffer object containing the uncompressed data. UPX will
+        apply 32-bit filters by default, so this function is better suitable
+        for compressing i386+ 32-bit protected-mode code rather than 8086+
+        16-bit real-mode code. However, udata may contain arbitrary data
+        bytes, not only code.
+    tmp_filename: Name of temporary file to be used while running UPX.
+    method: Sequence of strings (command-line arguments) describing the
+       compression method and parameters. To be analyzed and passed to UPX.
+    need_decompress_code: bool indicating whether ch.decompress_code and
+        ch.unfilter_code should be filled with i386 code containing nonempty
+        strings. If false, the strings will be empty.
+    do_swap: bool indicating whether whether the padding data should come
+        before the uncompressed data. If None is specified, it autodetects
+        the best value based on the argument method.
+    load_addr: Nonnegative integer specifying the memory address to which
+        the (temporary) Linux 386 ELF-32 should be loaded. If None is
+        specified, the smallest default will be used.
   Returns:
-    An UpxCompressed object describing the compressed output data.
+    An UpxCompressed object containing the compressed output data, the
+    parameters, the decompressord code and the unfilter code.
   """
   if not isinstance(udata, (str, buffer)):
     raise TypeError
@@ -1156,11 +1201,11 @@ def upx_compress32(
     elf32_size, elf32_header, padding_data = run_upx_elf32(
         udata, tmp_filename, method, padding=padding, load_addr=load_addr)
   if elf32_size is False:  # ': NotCompressibleException' or first run.
-    # Since we are using padding=bool(...), there is no need to avoid the UPX
+    # Since we are using padding = bool(...), there is no need to avoid the UPX
     # error: ': file is too small' by adding padding (for
     # Packer::checkDefaultCompressionRatio), which is OK with at least 4096
     # bytes or 6.25% gain.
-    padding=bool(do_swap)
+    padding = bool(do_swap)
     elf32_size, elf32_header, padding_data = run_upx_elf32(
         udata, tmp_filename, method, padding=padding, load_addr=load_addr)
     # ': NotCompressibleException'.
@@ -1326,13 +1371,34 @@ FORMAT0_SMART_DECOMPRESS_CODE_SIZE = 23
 
 
 def get_smart_decompress_code(ch, udata=None):
-  """Returns the Linux i386 code for the smart_decompress function.
+  """Returns the cdecl i386 code+data for the smart_decompress function.
 
-  The smart_decompress function is position-independent and self-contained, and it
-  contains ch.compressed_data in the end. Its signature in the Linux i386 ABI
-  (see http://wiki.osdev.org/System_V_ABI):
+  The smart_decompress function writes the uncompressed data to the outp
+  output buffer specified in its argument. During this it does an actual
+  decompression, which is slow for LZMA and fast for NRV. The decompressor
+  code and the compressed data (ch.compressed_data) are also included in the
+  body of smart_decompress.
 
-    void smart_decompress(char *outp) __attribute__((regparm(3)));
+  The behavior of smart_decompress is undefined if the data is corrupt or
+  truncated or the output buffer is too short. (There is also some
+  decompression error detection causing a cli ++ hlt on error.)
+
+  The stack usage of the smart_decompress function is less than 0x3fdc ==
+  16348 (sic) bytes for LZMA decompression (with the default upx
+  --crp-lzma-lc=3 --crp-lzma-lp=0), and less than 0x34 == 52 bytes for
+  others (NRV). These limit values are results of test runs. The limit for
+  LZMA decompression is: 4060 + (1536 << ((--crp-lzma-lc) +
+  (--crp-lzma-lp))) bytes, with the default shift amount being 3 by default,
+  and it can go up to 12.
+
+  The smart_decompress function is position-independent and self-contained,
+  and it contains ch.compressed_data in the end. It uses the GCC regparm(1)
+  calling convention: it receives its argument in EAX, and it may modify
+  stack registers EAX, EDX, ECX and EFLAGS.
+
+  Its signature in GCC i386 C syntax:
+
+    void smart_decompress(char *outp) __attribute__((regparm(1)));
 
   It will do the decompression and write ch.ubufsize bytes starting at outp.
   The outp argument must be passed in the register eax (not on the stack).
@@ -1341,6 +1407,7 @@ def get_smart_decompress_code(ch, udata=None):
   FORMAT0_SMART_DECOMPRESS_CODE_SIZE), i.e. the returned code is only this
   much longer than the data.
 
+  !! TODO(pts): Refactor it to use the stack.
   The smart_decompress function temporarily modifies a variable in its code
   (.text), because the decompress function modifies its *ubufsizep arg (and
   then it changes it back), so you need to link your Linux program with
@@ -1369,9 +1436,9 @@ def get_smart_decompress_code(ch, udata=None):
     # !! TODO(pts): Is unfilter_code = ch.unfilter_code.lstrip('\x90') safe here?
     # .rstrip('\0') isn't safe, because it ruins the relative offsets of the
     # following ch.decompress_code.
-    code = [
+    code = [  # smart_decompress_filter.
         '\xe8\x00\x00\x00\x00\x92\x58\x6a',
-        struct.pack('<B', ch.filter_cto),
+        struct.pack('<B', ch.filter_cto),  # This sign-extends ch.filter_cto. This is OK, lxunfilter will use only the low byte anyway.
         '\x05',
         struct.pack('<L', len(ch.unfilter_code) + len(ch.decompress_code) + 0x38 - 0x5),
         '\x50\x52\x68',
@@ -1382,7 +1449,7 @@ def get_smart_decompress_code(ch, udata=None):
         'UPX~', ch.unfilter_code, ch.decompress_code,
     ]
   else:  # Based on smart_decompress.nasm .
-    code = [
+    code = [  # smart_decompress.
         '\xe8\x00\x00\x00\x00\x92\x58\x05',
         struct.pack('<L', len(ch.decompress_code) + 0x2b - 0x5),
         '\x50\x52\x68',
@@ -1401,7 +1468,64 @@ def get_smart_decompress_code(ch, udata=None):
 
 
 def compress_flat32(udata, tmp_filename, method=None, prefix_size=0):
-  """Compresses a position-independent executable !! write docstring"""
+  """Compresses i386+ 32-bit protected-mode code.
+
+  The returned string contains self-decompressing compressed code, whose
+  decompressor is position-independent (i.e. it can be loaded to and run
+  from any memory address).
+
+  The returned compressed code is almost equivalent to the original
+  uncompressed code (in udata), with the following differences:
+
+  * The compressed code is usually shorter the original uncompressed code.
+    It's never longer: if all compression efforts fail, the original
+    uncompressed code is returned.
+  * The compressed code works only if called right at the beginning.
+  * Upon the call, it decompresses itself in-place, and starts running the
+    decompresed code at its original location (from the beginning).
+  * The decompressor modifies registers EAX, EBX, ECX (setting it to 0),
+    ESI, EDI and EFLAGS. Thus the original uncompressed code will receive
+    garbage in these registers.
+    !!! TODO(pts): Save and restore all registers.
+  * For the decompression, additional memory bytes may be used and modified
+    after the compressed data. How many bytes are used is unspecified,
+    typically it shouldn't be more than 5 KiB + the size of the compressed
+    data. These bytes are left the as garbage (i.e. not zeroed) after the
+    decompression.
+  * Some stack space is used for the decompresion, the exact number of bytes
+    is the same of the smart_decompress function returned by
+    get_smart_decompress(...), i.e. <16 KiB for LZMA and <52 bytes for others.
+    !!! Use only 28 bytes of stack (EAX, EDX, ECX, ESI, EDI, ESP, return address).
+  * The decompression doesn't use any system calls, non-user-mode registers,
+    global variables or any data at a fixed address. It works when interrupts
+    are disabled.
+  * The compressed code works only in read-write-execute segments, because
+    it modifies itself. (On Linux, create such programs with `gcc -Wl,-N` or
+    use mmap(2) with PROT_READ|PROT_WRITE|PROT_EXEC to allocate the memory.)
+  * The behavior of the decompressor is undefined if the compressed data is
+    corrupt or truncated, or there isn't enough room after the compressed
+    data or if there isn't enough stack space. There is also some
+    decompression error detection causing a cli ++ hlt on error.
+
+  The compression parameters are not stored in the result, so there is no
+  easy way to decompress it other than running it, and stopping the
+  execution before it jumps to the just-decompressed code. (This is not easy
+  either.)
+
+  Args:
+    udata: i386+ 32-bit protected-mode code to compress. It may also contain
+       data.
+    tmp_filename: Name of temporary file to be used while running UPX.
+    method: Sequence of strings (command-line arguments) describing the
+       compression method and parameters. To be analyzed and passed to UPX.
+    prefix_size: Number of bytes to discard at the beginning of udata before
+        compression.
+  Returns:
+    String containing the self-decompressing compressed code, which is
+    almost equivalent to the original code in udata, but usually shorter.
+    It's never longer: if all compression efforts fail, the original udata
+    (converted to a string) is returned.
+  """
   if not isinstance(udata, (str, buffer)):
     raise TypeError
   if len(udata) < prefix_size:

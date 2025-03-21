@@ -2,7 +2,7 @@
 ; smart_decompress_filter.nasm: position-independent ...
 ; by pts@fazekas.hu at Tue Jan  2 00:07:23 CET 2018
 ;
-; $ nasm -f bin -o smart_decompress.bin smart_decompress.nasm && ndisasm -b 32 smart_decompress.bin >smart_decompress.disasm
+; $ nasm -f bin -o smart_decompress_filter.bin smart_decompress_filter.nasm && ndisasm -b 32 smart_decompress._filter.bin >smart_decompress_filter.disasm
 ;
 ; This code is not used by upxbc. The portions used have been copied
 ; over manually from *.disasm .
@@ -17,7 +17,7 @@ bits 32
 
 cto8 equ 0xb
 
-smart_decompress:
+smart_decompress_filter:
 ; Now stack: return_address
 call .after_call_next
 .after_call_next:
