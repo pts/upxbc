@@ -53,7 +53,7 @@ def parse_struct(fields, data):
 
 
 def dump_struct(fields, data):
-  if verbose[0] <= 0:
+  if verbose[0] <= 1:
     return
   format = '<' * (fields[0][1][0] not in '<>') + ''.join(f[1] for f in fields)
   values = struct.unpack(format, data)
@@ -369,12 +369,42 @@ class UpxCompressed(object):
             '%s=%r' % (name, getattr(self, name))
             for name in sorted(self.__slots__)))
 
+  @property
+  def stack_usage(self):
+    """Returns an upper limit for the i386 stack usage in bytes for decompression.
+
+    The result is always divisible by 4.
+    """
+    if self.method == self.M_LZMA:
+      lclp = ord(self.compressed_data[0]) >> 3  # lit_context_bits + lit_pos_bits. 3 by default, can be up to 12.
+      return 48 + 4060 + (1536 << lclp)
+    return 48 + 52
+
+  def get_stats(self):
+    stats_dict = {'stack_usage': self.stack_usage}
+    if self.method == self.M_LZMA:
+      b = ord(self.compressed_data[0])
+      stats_dict['lzma_pb'] = b & 7  # pos_bits. 2 by default.
+      stats_dict['lzma_lclp'] = b >> 3  # lit_context_bits + lit_pos_bits. 3 by default, can be up to 12.
+    for name in self.__slots__:
+      value = getattr(self, name)
+      if name.endswith('_data') or name.endswith('_code') or name.endswith('_header'):
+        stats_dict[name + '_size'] = len(value)
+      else:
+        stats_dict[name] = value
+    return stats_dict
+
+  def get_stats_formatted(self):
+    return ' '.join(
+        '%s=%r' % (name, value)
+        for name, value in sorted(self.get_stats().iteritems()))
+
 
 def upx_make_uncompressed(udata, need_decompress_code=True):
   """Returns UpxCompressed representing the original, uncompressed data."""
   if not isinstance(udata, (str, buffer)):
     raise TypeError
-  return UpxCompressed(
+  ch = UpxCompressed(
       method=0,
       filter=0,
       filter_cto=0,
@@ -385,6 +415,10 @@ def upx_make_uncompressed(udata, need_decompress_code=True):
       unfilter_code='\xc3' * bool(need_decompress_code),  # ret.
       compressed_elf32_header='',
   )
+  if verbose[0] >= 1:
+    print >>sys.stderr, (
+        'info: uncompressed stats: %s' % ch.get_stats_formatted())
+  return ch
 
 
 def adler32_combine(adler1, adler2, len2):
@@ -889,7 +923,7 @@ def parse_elf32_compressed_by_upx(
   # See funpad4(fi) in PackLinuxElf32::unpack.
   i += (-i & 0x3)  # Round up to 4 bytes.
   loader_ofs = i
-  if verbose[0] >= 1:
+  if verbose[0] >= 2:
     print 'loader_ofs = 0x%x' % i
   after_loader_ofs = loader_ofs + l_info['l_lsize']
   if data[after_loader_ofs : after_loader_ofs + 16] != '\0\0\0\0UPX!\0\0\0\0UPX!':
@@ -906,7 +940,7 @@ def parse_elf32_compressed_by_upx(
   i += 8
   sizea = i - ofsa
   # What are these offsets? Who emits them?
-  if verbose[0] >= 1:
+  if verbose[0] >= 2:
     print 'ofsa = 0x%x' % ofsa
     print 'ofsb = 0x%x' % ofsb
     print 'sizea = 0x%x' % sizea
@@ -955,7 +989,7 @@ def parse_elf32_compressed_by_upx(
   ph_checksum = sum(ord(c) for c in buffer(data, i + 4, 27)) % 251
   dump_struct(ph_fields, data[i : i + 32])
   overlay_ofs, = struct.unpack('<L', data[i + 32 : i + 36])
-  if verbose[0] >= 1:
+  if verbose[0] >= 2:
     print 'overlay_ofs = 0x%x' % overlay_ofs
   i += 36
   if i != len(data):
@@ -1042,7 +1076,7 @@ def parse_elf32_compressed_by_upx(
 
   if not need_decompress_code:
     decompress_code = unfilter_code = ''
-  return UpxCompressed(
+  ch = UpxCompressed(
       method=data_b_info['b_method'],
       filter=data_b_info['b_ftid'],
       filter_cto=filter_cto,
@@ -1053,6 +1087,10 @@ def parse_elf32_compressed_by_upx(
       # Unused by default, will be used only with
       # compress_upxz(..., do_add_compressed_elf32_header=False).
       compressed_elf32_header=str(compressed_elf32_header))
+  if verbose[0] >= 1:
+    print >>sys.stderr, (
+        'info: UPX compression stats: %s' % ch.get_stats_formatted())
+  return ch
 
 
 def get_ph_info(data):
@@ -1321,6 +1359,9 @@ def decompress_upxz(upxz_data, tmp_filename):
       decompress_code='',
       unfilter_code='',
       compressed_elf32_header=compressed_elf32_header)
+  if verbose[0] >= 1:
+    print >>sys.stderr, (
+        'info: upxz decompression stats: %s' % ch.get_stats_formatted())
   elf32_data = build_elf32_for_upx_decompression(
       ch=ch,
       tmp_filename=tmp_filename,
@@ -1575,7 +1616,7 @@ def get_strip_elf32_size(udata):
   if len(udata) < 0x54:
     raise ValueError
   ehdr = parse_struct(EHDR_FIELDS, buffer(udata, 0, 0x34))
-  if verbose[0] >= 2:
+  if verbose[0] >= 3:
     dump_struct(EHDR_FIELDS, buffer(udata, 0, 0x34))
   elf32_header_size = ehdr['e_phoff'] + 0x20 * ehdr['e_phnum']
   if len(udata) < elf32_header_size:
@@ -1697,7 +1738,7 @@ def strip_elf32(udata):
     keep_size = max(keep_size, k)
 
   # Keep only the first keep_size bytes.
-  if verbose[0] >= 1:
+  if verbose[0] >= 2:
     print 'keep_size=0x%x' % keep_size
   # True but slow:
   # if keep_size != get_strip_elf32_size(udata):
@@ -1898,7 +1939,7 @@ def compress_elftiny32(udata, tmp_filename, method=None):
     text_data = [text_data]
     extra_phdrs = []
     for phi in xrange(1, ehdr['e_phnum']):
-      if verbose[0] >= 1:
+      if verbose[0] >= 2:
         print 'Subsequent ELF header %d:' % phi
       phdrst = buffer(udata, 0x34 + phi * 0x20, 0x20)
       if len(phdrst) != 0x20:
