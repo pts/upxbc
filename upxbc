@@ -299,6 +299,10 @@ class UpxCompressed(object):
   M_NRV2E_LE32 = 8
   M_LZMA = 14
 
+  METHOD_NAMES = {
+      M_NONE: 'uncompressed', M_NRV2B_LE32: 'NRV2B_LE32',
+      M_NRV2D_LE32: 'NRV2D_LE32', M_NRV2E_LE32: 'NRV2E_LE32', M_LZMA: 'LZMA'}
+
   __slots__ = (
       # Compression method (algorithm) identifier, one one
       # M_NONE (0), M_NRV2B_LE32 (2), M_NRV2D_LE32 (5, rare),
@@ -405,7 +409,7 @@ def upx_make_uncompressed(udata, need_decompress_code=True):
   if not isinstance(udata, (str, buffer)):
     raise TypeError
   ch = UpxCompressed(
-      method=0,
+      method=UpxCompressed.M_NONE,
       filter=0,
       filter_cto=0,
       compressed_data=str(udata),
@@ -1562,7 +1566,8 @@ def compress_flat32(udata, tmp_filename, method=None, prefix_size=0):
     prefix_size: Number of bytes to discard at the beginning of udata before
         compression.
   Returns:
-    String containing the self-decompressing compressed code, which is
+    (data, stats). stats is upx_compressed.get_stats(). str is a
+    string containing the self-decompressing compressed code, which is
     almost equivalent to the original code in udata, but usually shorter.
     It's never longer: if all compression efforts fail, the original udata
     (converted to a string) is returned.
@@ -1591,7 +1596,7 @@ def compress_flat32(udata, tmp_filename, method=None, prefix_size=0):
   ))
   if len(data) >= len(udata):
     return udata  # Can't improve file size, keep original.
-  return data
+  return data, ch.get_stats()
 
 
 def compress_c32(udata, tmp_filename, method=None):
@@ -2009,7 +2014,7 @@ def compress_elftiny32(udata, tmp_filename, method=None):
   # return build_elftiny32(
   #     text_data, load_addr, entry_addr, end_addr, extra_phdrs, e_osabi)
 
-  #data = build_elftiny32(
+  #data, stats = build_elftiny32(
   #    text_data, load_addr, entry_addr, end_addr, extra_phdrs, e_osabi)
   #open('te.bin', 'wb').write(data)  # This works with `gcc -static'.
   #os.chmod('te.bin', 0700)
@@ -2060,11 +2065,11 @@ def compress_elftiny32(udata, tmp_filename, method=None):
              ch.decompress_code, ch.compressed_data))
       if len(cp_text_data) != cp_text_data_size:
         raise AssertionError
-      return build_elftiny32(
+      return (build_elftiny32(
           cp_text_data, cp_load_addr, cp_load_addr,
           max(end_addr, load_addr + ch.ubufsize),
-          extra_phdrs, e_osabi)
-  return strip_elf32(udata)  # Can't make it smaller, just strip it.
+          extra_phdrs, e_osabi), ch.get_stats())
+  return strip_elf32(udata), {'method': 0}  # Can't make it smaller, just strip it.
 
 
 # !! upx-3.92 and upx-3.94 don't report AlreadyPackedException with -q; they just don't create the output file.
@@ -2122,7 +2127,7 @@ def compress_flat32_to_asm(udata, tmp_filename, method=None, prefix_size=0):
   def to_byte(s):
     return '.byte %s\n' % ','.join(str(ord(c)) for c in s)
 
-  return ''.join((
+  return (''.join((
       '/* smart_decompress_size = %d */\n' % len(smart_decompress_code),
       '.text\n',
       '.globl prefix_data\n',
@@ -2140,18 +2145,18 @@ def compress_flat32_to_asm(udata, tmp_filename, method=None, prefix_size=0):
       '.globl smart_decompress\n',
       'smart_decompress:\n',
       to_byte(smart_decompress_code),
-  ))
+  )), ch.get_stats())
 
 
 def example():
-  data = compress_flat32_to_asm(open('example_text.c32', 'rb').read(), 't.tmp', prefix_size=19)
+  data, stats = compress_flat32_to_asm(open('example_text.c32', 'rb').read(), 't.tmp', prefix_size=19)
   open('deco.s', 'w').write(data)
   # See decot.c for running the decompressor.
   # $ xstatic gcc -s -Os -Wl,-N -W -Wall -Werror -o decot decot.c deco.s && ./decot >decot.out
   # $ cmp decot.out example_text.c32
 
   #data = compress_c32(open('a.c32', 'rb').read(), 't.tmp')
-  data = compress_c32(open('../../tinyc32/examples/hello_long.c32', 'rb').read(), 't.tmp')
+  data, stats = compress_c32(open('../../tinyc32/examples/hello_long.c32', 'rb').read(), 't.tmp')
   open('a.c32', 'wb').write(data)
 
   prefix_size = 7
@@ -2752,24 +2757,25 @@ def main(argv):
     sys.exit('fatal: --decompress not supported by input format: %s' %
              input_format)
 
+  stats = None
   if input_format == output_format == 'flat32':
-    data = compress_flat32(
+    data, stats = compress_flat32(
         udata, tmp_filename, method=method, prefix_size=(prefix_size or 0))
   elif input_format == output_format == 'flat16':
     data = compress_flat16(
         udata, tmp_filename, method=method, load_addr=load_addr,
         signature_start_ofs_max=(signature_start_ofs_max or 0))
   elif input_format == 'flat32' and output_format == 'asm':
-    data = compress_flat32_to_asm(
+    data, stats = compress_flat32_to_asm(
         udata, tmp_filename, method=method, prefix_size=(prefix_size or 0))
   elif input_format == output_format == 'c32':
     # TODO(pts): Add decompressor by analyzing assembly code in
     # smart_decompress_code: figuring out method (2, 5, 8 or 14), filter (0,
     # 0x46 or 0x49), filter_cto. Still we may get a little bit different file
     # for elftiny32.
-    data = compress_c32(udata, tmp_filename, method=method)
+    data, stats = compress_c32(udata, tmp_filename, method=method)
   elif input_format == 'elf' and output_format == 'elftiny32':
-    data = compress_elftiny32(udata, tmp_filename, method=method)
+    data, stats = compress_elftiny32(udata, tmp_filename, method=method)
     do_set_executable_bit = True
   elif input_format == 'elf' and output_format == 'elfstrip32':
     data = strip_elf32(udata)
@@ -2794,12 +2800,14 @@ def main(argv):
         'fatal: unsupported combination of '
         'input format %s and output format %s' %
         (input_format, output_format))
-  if do_decompress:
-    print >>sys.stderr, 'info: writing uncompressed output: %s (%d bytes, format %s)' % (
-        output_file, len(data), output_format)
-  else:
-    print >>sys.stderr, 'info: writing compressed output: %s (%d bytes, format %s)' % (
-        output_file, len(data), output_format)
+  stats_entries = ['%d bytes' % len(data), 'format %s' % output_format]
+  if stats:
+    stats_entries.append('method %s' % UpxCompressed.METHOD_NAMES.get(
+        stats.get('method'), '?'))
+  stats_str = ', '.join(stats_entries)
+  compressed_type = ('compressed', 'uncompresed')[bool(do_decompress)]
+  print >>sys.stderr, 'info: writing %s output: %s (%s)' % (
+      compressed_type, output_file, stats_str)
   try:
     f = open(output_file, 'wb')
   except IOError:  # E.g. 'Text file busy'.
