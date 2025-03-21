@@ -25,8 +25,8 @@ xchg eax, edx  ; We use it for: eax := edx.
 pop eax
 ; Now eax is the address of .after_call_next.
 push byte cto8
-; Now stack: return_address cto8
-add eax, dword strict sz_unc - .after_call_next
+; Now stack (bottom with high address first): return_address cto8
+add eax, dword strict sz_unc - .after_call_next  ; Patch this.
 push eax  ; &outs
 ; Now stack: return_address cto8 &outs
 push edx  ; outp
@@ -36,8 +36,7 @@ push dword strict compressed_data_end - compressed_data
 add eax, 4  ; Skip over ubufsize_internal (no uncompressed_data_size).
 push eax  ; dword compressed_data
 ; Now stack: return_address cto8 &outs outp compressed_data_size compressed_data
-call decompress
-.after_call_decompress:
+call decompress  ; Patch this.
 test eax, eax
 jz .decompress_ok
 cli
@@ -50,12 +49,11 @@ pop eax
 pop edx
 push dword [edx]
 push eax
-call lxunfilter
-.after_call_lxunfilter:
+call lxunfilter  ; Patch this, in case ret_code has changed size.
 pop eax
 pop eax
 pop eax
-ret
+ret  ; May be replaced with arbitrary ret_code.
 
 signature:
 db 'UPX~'
@@ -66,7 +64,7 @@ decompress:
 db 'DECOMPRESS'
 
 sz_unc:
-dd 42
+dd 42  ; Patch this.
 compressed_data:
 db 'COMPRESSED'
 compressed_data_end:

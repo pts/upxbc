@@ -1427,7 +1427,7 @@ def decompress_upxz(upxz_data, tmp_filename):
 FORMAT0_SMART_DECOMPRESS_CODE_SIZE = 23
 
 
-def get_smart_decompress_code(ch, udata=None):
+def get_smart_decompress_code(ch, udata=None, ret_code='\xc3'):
   """Returns the cdecl i386 code+data for the smart_decompress function.
 
   The smart_decompress function writes the uncompressed data to the outp
@@ -1476,6 +1476,7 @@ def get_smart_decompress_code(ch, udata=None):
     udata: The uncompressed input data (code), or None. If not None, then
         an uncompressed smart_decompress function is also generated, and
         the smaller of the compressed and the uncompressed is returned.
+    ret_code: String containing code bytes to put to the end of the function.
   Returns:
     tuple of ch (possibly new) and
     str containing position-independent Linux i386 machine code for the
@@ -1497,21 +1498,27 @@ def get_smart_decompress_code(ch, udata=None):
         '\xe8\x00\x00\x00\x00\x92\x58\x6a',
         struct.pack('<B', ch.filter_cto),  # This sign-extends ch.filter_cto. This is OK, lxunfilter will use only the low byte anyway.
         '\x05',
-        struct.pack('<L', len(ch.unfilter_code) + len(ch.decompress_code) + 0x38 - 0x5),
+        struct.pack('<L', len(ch.unfilter_code) + len(ch.decompress_code) + 0x37 - 0x5 + len(ret_code)),
         '\x50\x52\x68',
         struct.pack('<L', len(ch.compressed_data)),
         '\x83\xc0\x04\x50\xe8',
-        struct.pack('<L', len(ch.unfilter_code) + 0x38 - 0x1e),
-        '\x85\xc0\x74\x02\xfa\xf4\x58\x58\x58\x5a\xff\x32\x50\xe8\x08\x00\x00\x00\x58\x58\x58\xc3',
+        struct.pack('<L', len(ch.unfilter_code) + 0x37 - 0x1e + len(ret_code)),
+        '\x85\xc0\x74\x02\xfa\xf4\x58\x58\x58\x5a\xff\x32\x50\xe8',
+        struct.pack('<L', 7 + len(ret_code)),
+        '\x58\x58\x58',
+        ret_code,
         'UPX~', ch.unfilter_code, ch.decompress_code,
     ]
   else:  # Based on smart_decompress.nasm .
     code = [  # smart_decompress.
         '\xe8\x00\x00\x00\x00\x92\x58\x05',
-        struct.pack('<L', len(ch.decompress_code) + 0x2b - 0x5),
+        struct.pack('<L', len(ch.decompress_code) + 0x2a - 0x5 + len(ret_code)),
         '\x50\x52\x68',
         struct.pack('<L', len(ch.compressed_data)),
-        '\x83\xc0\x04\x50\xe8\x0f\x00\x00\x00\x85\xc0\x74\x02\xfa\xf4\x58\x58\x58\x58\xc3',
+        '\x83\xc0\x04\x50\xe8',
+        struct.pack('<L', 15 + len(ret_code)),
+        '\x85\xc0\x74\x02\xfa\xf4\x58\x58\x58\x58',
+        ret_code,
         'UPX~', ch.decompress_code,
     ]
   code.extend((struct.pack('<L', ch.ubufsize), ch.compressed_data))
@@ -1540,19 +1547,18 @@ def compress_flat32(udata, tmp_filename, method=None, prefix_size=0):
   * The compressed code works only if called right at the beginning.
   * Upon the call, it decompresses itself in-place, and starts running the
     decompresed code at its original location (from the beginning).
-  * The decompressor modifies registers EAX, EBX, ECX (setting it to 0),
-    ESI, EDI and EFLAGS. Thus the original uncompressed code will receive
-    garbage in these registers.
-    !!! TODO(pts): Save and restore all registers.
+  * The decompressor keeps the 8 general purpose registers, EFLAGS and the
+    segment registers intact. (It does so by saving and restoring them.)
   * For the decompression, additional memory bytes may be used and modified
     after the compressed data. How many bytes are used is unspecified,
     typically it shouldn't be more than 5 KiB + the size of the compressed
     data. These bytes are left the as garbage (i.e. not zeroed) after the
     decompression.
-  * Some stack space is used for the decompresion, the exact number of bytes
-    is the same of the smart_decompress function returned by
-    get_smart_decompress(...), i.e. <16 KiB for LZMA and <52 bytes for others.
-    !!! Use only 28 bytes of stack (EAX, EDX, ECX, ESI, EDI, ESP, return address).
+  * The decompressor uses only 44 bytes of (temporary) stack space. While
+    doing the decompression, it uses its own stack. The memory layout while
+    decompression is: decompression_destination_buffer + decompression_stack
+    + copy_of_decompressor_code + copy_of_compressed_data.
+    !!! Align stack to multiple of 4.
   * The decompression doesn't use any system calls, non-user-mode registers,
     global variables or any data at a fixed address. It works when interrupts
     are disabled.
@@ -1595,15 +1601,16 @@ def compress_flat32(udata, tmp_filename, method=None, prefix_size=0):
     # Output too short, `rep movsb' would move in the wrong direction below.
     # Just keep it uncompressed.
     return udata
-  ch, smart_decompress_code = get_smart_decompress_code(ch, udata_after_prefix)
+  ch, smart_decompress_code = get_smart_decompress_code(
+       ch, udata_after_prefix, ret_code='\x89\xec\x61\x9d\xc3')
   data = ''.join((  # Based on move_smart_decompress.nasm .
       udata[:prefix_size],
-      '\xe8\x00\x00\x00\x00\x5b',
+      '\x50\x9c\x60\x89\xe5\xe8\x00\x00\x00\x00\x58\x8d\x40\xf6\x89\x45\x24',
       struct.pack('<1sL', '\xb9', len(smart_decompress_code)),
-      '\x8d\x74\x0b\x1d',
-      struct.pack('<2sL', '\x8d\xbe', ch.ubufsize - 0x23),
-      '\x41\xfd\xf3\xa4\xfc\x8d\x43\xfb\x50',
-      struct.pack('<1sL', '\xe9', ch.ubufsize - 0x23),
+      # Allow 0x180 bytes of stack usage for interrupts.
+      struct.pack('<2sL', '\x8d\xb0', ch.ubufsize + max(ch.stack_usage, 0x180)),
+      '\x83\xe6\xfc\x89\xf4\x8d\x74\x08\x2e\x8d\x7c\x0c\xff\xfd\xf3\xa4\xfc'
+          '\xff\xe4',
       smart_decompress_code,
   ))
   if len(data) >= len(udata):
