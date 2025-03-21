@@ -30,8 +30,6 @@ About the System V i386 ABI and calling convention (cdecl):
 * See also: http://wiki.osdev.org/System_V_ABI
 * Doc: https://www.sco.com/developers/devspecs/abi386-4.pdf
 * Doc: https://www.uclibc.org/docs/psABI-i386.pdf
-
-!!! Make sure that specifying --lzma only disables all NRV. Make sure that both are enabled if --no-lzma is not specified.
 """
 
 import array
@@ -598,6 +596,12 @@ UPX_NRV_METHOD_FLAGS = ('--nrv2b', '--nrv2d', '--nrv2e')
 
 
 def get_upx_method_flags(method, do_add_lzma_by_default=True):
+  # If method contains --lzma or --no-lzma, then we make UPX respect that.
+  #
+  # To make UPX try both LZMA and non-LZMA, and pick the one with shorter
+  # output, specify brute or --ultra-brute (it's not possible with --best
+  # or the effort flags).
+
   if isinstance(method, str):
     method = method.replace(',', ' ').split()
   method = ['-' * (1 + (flag not in '123456789')) + flag for flag in
@@ -628,6 +632,10 @@ def get_upx_method_flags(method, do_add_lzma_by_default=True):
   if '--no-lzma' in method:
     if '--lzma' in method:
       raise ValueError('Both --lzma and --no-lzma was specified.')
+    # Surprisingly, `upx --no-lzma --ultra-brute' still produces LZMA
+    # output. To prevent that, we put --no-lzma last.
+    method = [flag for flag in method if flag != '--no-lzma']
+    method.append('--no-lzma')
     if not has_effort:
       # `--ultra-brute --no-lzma' doesn't produce LZMA output.
       method[:0] = ('--ultra-brute',)
@@ -647,15 +655,17 @@ def get_upx_method_flags(method, do_add_lzma_by_default=True):
     if not has_effort:
       if has_nrv:
         # --brute or --ultra-brute would shadow --nrv... , and it may make
-        # --UPX choose the wrong NRV algorithm.
-        method[:0] = ('--best', '--no-lzma')
+        # UPX choose the wrong NRV algorithm.
+        method[:0] = ('--best',)
+        method.append('--no-lzma')
       elif do_add_lzma_by_default:
         method[:0] = ('--ultra-brute', '--lzma')
       else:
-        method[:0] = ('--ultra-brute', '--no-lzma')
+        method[:0] = ('--ultra-brute',)
+        method.append('--no-lzma')
     elif has_nonlzma_effort:
       # Doesn't make a difference, just makes it explicit.
-      method[:0] = ('--no-lzma',)
+      method.append('--no-lzma')
     elif has_nrv:  # --nrv... with --brute or --ultra-brute.
       raise ValueError(
           '--brute or --ultra-brute would shadow --nrv... ; '
@@ -665,15 +675,17 @@ def get_upx_method_flags(method, do_add_lzma_by_default=True):
       # Doesn't make a difference, just makes it explicit.
       method[:0] = ('--lzma',)  # Make it explicit.
     else:
-      method[:0] = ('--no-lzma',)
+      method.append('--no-lzma',)
   if ('--lzma' in method) + ('--no-lzma' in method) != 1:
     raise AssertionError
   return method
 
 assert get_upx_method_flags('') == ['--ultra-brute', '--lzma']
 assert get_upx_method_flags('--lzma') == ['--best', '--lzma']
-assert get_upx_method_flags('--nrv2b') == ['--best', '--no-lzma', '--nrv2b']
+assert get_upx_method_flags('--nrv2b') == ['--best', '--nrv2b', '--no-lzma']
 assert get_upx_method_flags('--no-lzma') == ['--ultra-brute', '--no-lzma']
+assert get_upx_method_flags('--ultra-brute --no-lzma') == ['--ultra-brute', '--no-lzma']
+assert get_upx_method_flags('--no-lzma --ultra-brute') == ['--ultra-brute', '--no-lzma']
 
 EHDR_FIELDS = (
     ('ei_mag', '4s'),
