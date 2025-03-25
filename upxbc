@@ -1581,8 +1581,10 @@ def compress_flat32(udata, tmp_filename, method=None, prefix_size=0):
     tmp_filename: Name of temporary file to be used while running UPX.
     method: Sequence of strings (command-line arguments) describing the
        compression method and parameters. To be analyzed and passed to UPX.
-    prefix_size: Number of bytes to discard at the beginning of udata before
-        compression.
+    prefix_size: Number of bytes to at the beginning of udata to keep
+       uncompressed before compression. It may contain data or code, but the
+       code will see the compressed bytes following it. To decompress them,
+       the code starting at this position has to be executed.
   Returns:
     (data, stats). stats is upx_compressed.get_stats(). str is a
     string containing the self-decompressing compressed code, which is
